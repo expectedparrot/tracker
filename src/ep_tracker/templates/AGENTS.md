@@ -26,6 +26,8 @@ repositories linked from projects here.
 
 ## Update rounds
 
+- Use `tracker survey guide` to explain status-update and assignment surveys;
+  use `tracker survey list` to show existing rounds and lifecycle stages.
 - `tracker updates prepare` builds local EDSL survey artifacts. Review them
   before fielding.
 - `tracker updates deploy` creates live Humanize surveys. Do this only when the

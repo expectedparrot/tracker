@@ -115,7 +115,8 @@ def guide() -> None:
         "agent_guidance": ["Run `tracker agent next` before acting and after each material change.",
             "Use CLI commands for state changes; do not edit tracker JSON or event files directly.",
             "Keep .tracker/private/ out of Git and share respondent links only with their named recipients."],
-        "next_steps": ["Run `tracker agent next` to inspect the current tracker and recommended action."]})
+        "next_steps": ["Run `tracker agent next` to inspect the current tracker and recommended action.",
+            "Run `tracker survey guide` to explain survey options or `tracker survey list` to inspect existing rounds."]})
 
 
 @main.command("next")
@@ -173,7 +174,7 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
             steps = [f"Run `tracker memo build --date {today}`."]
         else:
             stage, recommendation = "current", "Tracker state is current; review recent activity or start the next update round."
-            steps = ["Inspect recent events with `tracker history`.",
+            steps = ["Inspect survey rounds with `tracker survey list` and recent events with `tracker history`.",
                      "Start the next status round with `tracker updates prepare --id <round-id>` or assignment round with `tracker assignments prepare --id <round-id> --reviewer <person-id>`. "]
     emit(command, {"stage": stage, "tracker": read_config(root), "counts": counts,
         "recommendation": recommendation, "next_steps": steps})
@@ -941,6 +942,108 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
     applied_path.write_text(json.dumps(applied, indent=2) + "\n")
     append_event(root, "updates.applied", {"round_id": round_id, "status_updates": summary["status_updates"]})
     emit("tracker updates apply", {**applied, "next_steps": ["Review the task and feature status with `tracker memo build`."]})
+
+
+@main.group("survey")
+def survey_group() -> None:
+    """List survey rounds and explain the available survey workflows."""
+
+
+@survey_group.command("list")
+@click.option("--type", "survey_type", type=click.Choice(["task_status_update", "task_assignment"]))
+@click.pass_context
+def survey_list(ctx: click.Context, survey_type: str | None) -> None:
+    """List survey rounds and their local lifecycle status, without showing private links."""
+    root = root_or_fail("tracker survey list", ctx.obj["directory"])
+    definitions = {
+        "updates": ("task_status_update", "updates"),
+        "assignments": ("task_assignment", "assignments"),
+    }
+    rounds: dict[tuple[str, str], dict[str, Any]] = {}
+    warnings: list[str] = []
+    event_to_type = {
+        "updates.prepared": "updates", "updates.deployed": "updates",
+        "updates.collected": "updates", "updates.applied": "updates",
+        "assignments.prepared": "assignments", "assignments.deployed": "assignments",
+        "assignments.collected": "assignments", "assignments.applied": "assignments",
+    }
+    for event in events(root):
+        survey_family = event_to_type.get(event["kind"])
+        round_id = event["data"].get("round_id")
+        if survey_family and round_id:
+            key = (survey_family, round_id)
+            row = rounds.setdefault(key, {"type": definitions[survey_family][0], "round_id": round_id,
+                "events": []})
+            row["events"].append(event)
+    for family, (display_type, subdirectory) in definitions.items():
+        base = root / ".tracker" / subdirectory
+        if not base.exists():
+            continue
+        for directory in base.iterdir():
+            if directory.is_dir():
+                rounds.setdefault((family, directory.name), {"type": display_type, "round_id": directory.name,
+                    "events": []})
+    summaries: list[dict[str, Any]] = []
+    for (family, round_id), row in rounds.items():
+        display_type, subdirectory = definitions[family]
+        round_dir = root / ".tracker" / subdirectory / round_id
+        prepared_path = round_dir / "prepared.json"
+        private_dir = root / ".tracker" / "private" / subdirectory / round_id
+        deployed = (private_dir / "deployed.json").is_file()
+        partial_deploy = family == "updates" and any(private_dir.glob("*.deployment.json")) and not deployed
+        collected = (private_dir / "collected.json").is_file()
+        applied = (private_dir / "applied.json").is_file()
+        stage = ("applied" if applied else "collected" if collected else "deployed" if deployed
+                 else "partially_deployed" if partial_deploy else "prepared")
+        if not prepared_path.is_file():
+            stage = "incomplete"
+            warnings.append(f"{display_type} round {round_id} has no prepared.json artifact")
+        summary: dict[str, Any] = {"type": display_type, "round_id": round_id, "stage": stage,
+            "prepared": prepared_path.is_file(), "deployed": deployed, "collected": collected, "applied": applied}
+        if row["events"]:
+            ordered = sorted(row["events"], key=lambda item: item["recorded_at"])
+            summary["created_at"] = next((item["recorded_at"] for item in ordered if item["kind"].endswith(".prepared")), ordered[0]["recorded_at"])
+            summary["latest_event_at"] = ordered[-1]["recorded_at"]
+        if prepared_path.is_file():
+            try:
+                prepared = json.loads(prepared_path.read_text())
+                summary["created_at"] = prepared.get("created_at", summary.get("created_at"))
+                if family == "updates":
+                    surveys = prepared.get("surveys", {})
+                    summary["people_count"] = len(surveys)
+                    summary["task_count"] = sum(len(item.get("questions", {}).get("assigned", {})) for item in surveys.values())
+                else:
+                    summary["reviewer_id"] = prepared.get("reviewer_id")
+                    summary["task_count"] = len(prepared.get("tasks", {}))
+            except (OSError, json.JSONDecodeError) as exc:
+                stage = summary["stage"] = "incomplete"
+                warnings.append(f"Could not read {display_type} round {round_id}: {exc}")
+        summaries.append(summary)
+    if survey_type:
+        summaries = [item for item in summaries if item["type"] == survey_type]
+    summaries.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    emit("tracker survey list", {"surveys": summaries, "warnings": warnings,
+        "next_steps": ["Run `tracker survey guide` to see what each survey type collects and how to field it."]})
+
+
+@survey_group.command("guide")
+def survey_guide() -> None:
+    """Explain survey types, their audiences, and their command workflows."""
+    emit("tracker survey guide", {"survey_types": [
+        {"type": "task_status_update", "audience": "Each active team member gets a personalized survey.",
+         "collects": "Status and optional progress or blocker notes for their active assigned tasks, plus an optional general update.",
+         "commands": ["tracker updates prepare --id <round-id>", "tracker updates deploy <round-id>",
+                      "tracker updates collect <round-id>", "tracker updates apply <round-id>"]},
+        {"type": "task_assignment", "audience": "One named reviewer gets a survey containing all active unassigned tasks.",
+         "collects": "One engineer choice per task, or Leave unassigned.",
+         "commands": ["tracker assignments prepare --id <round-id> --reviewer <person-id>",
+                      "tracker assignments deploy <round-id>", "tracker assignments collect <round-id>",
+                      "tracker assignments apply <round-id>"]},
+    ], "lifecycle": ["prepare and review the local EDSL survey artifact", "deploy explicitly to create live Humanize links",
+        "send each private link to its intended respondent", "collect responses into .tracker/private/",
+        "apply responses to append tracker events"],
+        "privacy": "Survey respondent URLs and raw Results artifacts are kept under the gitignored .tracker/private/ directory.",
+        "next_steps": ["Run `tracker survey list` to inspect existing rounds."]})
 
 
 @memo_group.command("build")

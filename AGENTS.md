@@ -13,6 +13,8 @@ not edit tracker JSON files directly.
    again after each material change.
 3. Use `tracker guide` for the complete workflow and `tracker history` to
    inspect the append-only event record.
+   Use `tracker survey guide` to explain survey types and `tracker survey list`
+   to inspect their lifecycle without exposing private links.
 4. Make state changes through `tracker` commands. Never edit or delete files in
    `.tracker/events/`, `.tracker/tracker.json`, `.tracker/updates/`, or
    `.tracker/assignments/` by hand.

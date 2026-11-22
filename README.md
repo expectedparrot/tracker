@@ -70,3 +70,10 @@ engineer directly and leaves tasks marked “Leave unassigned” untouched.
 `tracker memo build` creates an immutable dated Markdown snapshot. If the team
 needs another snapshot for the same date, choose a new date; existing memo files
 are not overwritten.
+
+## Survey catalog
+
+Use `tracker survey list` to see status-update and task-allocation rounds and
+whether each is prepared, deployed, collected, or applied. It does not print
+respondent links. Run `tracker survey guide` for each survey's audience,
+questions, and exact lifecycle commands.
