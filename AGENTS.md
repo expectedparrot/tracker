@@ -22,13 +22,19 @@ not edit tracker JSON files directly.
    links and raw Humanize responses and is gitignored.
 6. Humanize deployment creates live surveys. Run `tracker updates deploy` or
    `tracker assignments deploy` only when the user has asked to field that
-   round. Send each respondent URL only to its intended person.
+   round. Send each respondent URL only to its intended person. Issue intake
+   is intentionally public and reusable; explain that submissions become
+   team-visible when applied before sharing its URL.
 7. For unassigned work, use `tracker assignments prepare --id <round>
    --reviewer <person>` to create one allocation survey listing all unassigned
    tasks and active engineers. The reviewer can assign, defer, flag probable
    completion for verification, or merge a duplicate into another active issue
    in the same project. Only an authorized reviewer should apply it; probable
    completion is not closure.
+8. Use `tracker intake prepare --id <round>` and the matching `deploy`,
+   `collect`, and `apply` commands for public issue reporting. Review the
+   survey before deployment; applying valid reports creates a feature and an
+   unassigned task. Raw responses and the deployed link are private.
 
 ## Implementing changes in this Python repo
 

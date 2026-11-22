@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from datetime import UTC, date, datetime
@@ -840,6 +841,195 @@ def assignments_apply(ctx: click.Context, round_id: str) -> None:
     emit("tracker assignments apply", {**result, "next_steps": ["Review ownership with `tracker status` or build a memo."]})
 
 
+@main.group("intake")
+def intake_group() -> None:
+    """Collect public issue reports and ingest them as tracker work."""
+
+
+@intake_group.command("prepare")
+@click.option("--id", "round_id", required=True)
+@click.pass_context
+def intake_prepare(ctx: click.Context, round_id: str) -> None:
+    """Build a public EDSL issue-report survey for the tracker's projects."""
+    root = root_or_fail("tracker intake prepare", ctx.obj["directory"])
+    QuestionFreeText, QuestionMultipleChoice, _, Survey = edsl_types()
+    if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
+        raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
+    current = state(root)
+    if not current["projects"]:
+        raise TrackerError("Add at least one project before preparing issue intake")
+    directory = root / ".tracker" / "intake" / round_id
+    if directory.exists():
+        raise TrackerError(f"Issue-intake round already exists: {round_id}")
+    directory.mkdir(parents=True)
+    project_choices = {f"{project['id']} — {project['name']}": project["id"]
+        for project in current["projects"].values()}
+    questions = [
+        QuestionFreeText(question_name="reporter_name",
+            question_text="Your name (required). This report will be visible to the team in its tracker."),
+        QuestionFreeText(question_name="reporter_email",
+            question_text="Email address (optional; include it if the team may need to follow up)."),
+        QuestionMultipleChoice(question_name="project", question_text="Which project is this issue about?",
+            question_options=list(project_choices)),
+        QuestionFreeText(question_name="issue_title", question_text="Issue title (required)."),
+        QuestionFreeText(question_name="issue_description", question_text="Describe the issue, expected behavior, or requested change."),
+        QuestionFreeText(question_name="related_urls",
+            question_text="Relevant URLs (optional; enter one URL per line)."),
+    ]
+    survey = Survey(questions)
+    survey_path = directory / "issue_report.survey.ep"
+    saved = survey.git.save(str(survey_path), message=f"Prepare public issue-intake survey {round_id}")
+    Survey.git.load(saved["path"])
+    prepared = {"schema_version": "ep-tracker.issue-intake/1.0", "round_id": round_id,
+        "created_at": datetime.now(UTC).isoformat(), "survey_path": str(survey_path.relative_to(root)),
+        "project_choices": project_choices}
+    (directory / "prepared.json").write_text(json.dumps(prepared, indent=2) + "\n")
+    append_event(root, "issue_intake.prepared", {"round_id": round_id, "project_ids": list(current["projects"])})
+    emit("tracker intake prepare", {"round_id": round_id, "project_count": len(project_choices),
+        "survey_path": str(survey_path), "artifacts": [str(directory)],
+        "next_steps": ["Review the survey, then deploy it publicly with `tracker intake deploy " + round_id + "`."]})
+
+
+@intake_group.command("deploy")
+@click.argument("round_id")
+@click.pass_context
+def intake_deploy(ctx: click.Context, round_id: str) -> None:
+    """Deploy the issue-report form publicly and return its reusable respondent URL."""
+    root = root_or_fail("tracker intake deploy", ctx.obj["directory"])
+    _, _, _, Survey = edsl_types()
+    directory = root / ".tracker" / "intake" / round_id
+    prepared_path = directory / "prepared.json"
+    if not prepared_path.is_file():
+        raise TrackerError(f"No prepared issue-intake survey named {round_id}")
+    private = root / ".tracker" / "private" / "intake" / round_id
+    private.mkdir(parents=True, exist_ok=True)
+    deployed_path = private / "deployed.json"
+    if deployed_path.exists():
+        raise TrackerError(f"Issue-intake survey {round_id} is already deployed")
+    prepared = json.loads(prepared_path.read_text())
+    survey = Survey.git.load(str(root / prepared["survey_path"]))
+    try:
+        info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} issue report {round_id}",
+            survey_description="Public form for reporting issues to the team tracker. Submissions become team-visible work after review and ingestion.",
+            survey_visibility="public", humanize_schema={"questions": {
+                "reporter_email": {"optional": True}, "related_urls": {"optional": True}}})
+    except Exception as exc:
+        raise TrackerError(f"Public Humanize deployment failed for issue-intake round {round_id}: {exc}") from exc
+    deployment = {key: info[key] for key in ("uuid", "respondent_url", "preview_url", "admin_url") if key in info}
+    deployed_path.write_text(json.dumps(deployment, indent=2) + "\n")
+    append_event(root, "issue_intake.deployed", {"round_id": round_id})
+    emit("tracker intake deploy", {"round_id": round_id, "deployment": deployment,
+        "warnings": ["This respondent URL is public and reusable. Anyone with it can submit a report."],
+        "next_steps": [f"Collect submissions with `tracker intake collect {round_id}`."]})
+
+
+@intake_group.command("collect")
+@click.argument("round_id")
+@click.pass_context
+def intake_collect(ctx: click.Context, round_id: str) -> None:
+    """Fetch public issue reports into a private EDSL Results package."""
+    root = root_or_fail("tracker intake collect", ctx.obj["directory"])
+    edsl_types()
+    try:
+        from edsl import Coop
+    except ImportError as exc:
+        raise TrackerError("EDSL Humanize support is unavailable in this installation") from exc
+    private = root / ".tracker" / "private" / "intake" / round_id
+    deployed_path = private / "deployed.json"
+    if not deployed_path.is_file():
+        raise TrackerError(f"No deployed issue-intake survey found for {round_id}")
+    if (private / "collected.json").exists():
+        raise TrackerError(f"Submissions for issue-intake round {round_id} were already collected")
+    deployment = json.loads(deployed_path.read_text())
+    try:
+        results = Coop().get_human_survey_responses(deployment["uuid"])
+    except Exception as exc:
+        raise TrackerError(f"Could not collect issue-intake responses: {exc}") from exc
+    saved = results.git.save(str(private / "issue_reports.results.ep"), message=f"Collect issue reports {round_id}")
+    (private / "collected.json").write_text(json.dumps({"result_path": saved["path"]}, indent=2) + "\n")
+    append_event(root, "issue_intake.collected", {"round_id": round_id})
+    emit("tracker intake collect", {"round_id": round_id,
+        "next_steps": [f"Review and create tracker work from reports with `tracker intake apply {round_id}`."]})
+
+
+@intake_group.command("apply")
+@click.argument("round_id")
+@click.pass_context
+def intake_apply(ctx: click.Context, round_id: str) -> None:
+    """Ingest valid public reports as new features and unassigned tasks."""
+    root = root_or_fail("tracker intake apply", ctx.obj["directory"])
+    _, _, Results, _ = edsl_types()
+    directory = root / ".tracker" / "intake" / round_id
+    private = root / ".tracker" / "private" / "intake" / round_id
+    prepared_path = directory / "prepared.json"
+    collected_path, applied_path = private / "collected.json", private / "applied.json"
+    if not prepared_path.is_file() or not collected_path.is_file():
+        raise TrackerError(f"Issue-intake round {round_id} must be prepared and collected before applying")
+    if applied_path.exists():
+        raise TrackerError(f"Issue-intake round {round_id} was already applied")
+    prepared = json.loads(prepared_path.read_text())
+    collected = json.loads(collected_path.read_text())
+    answer_rows = response_answers(collected["result_path"], Results)
+    current = state(root)
+    project_choices = prepared["project_choices"]
+    projects_by_label = {label: project_id for label, project_id in project_choices.items()}
+    existing_keys = {event["data"].get("response_key") for event in events(root)
+        if event["kind"] == "issue_report.ingested" and event["data"].get("intake_round") == round_id}
+    ingested: list[dict[str, str]] = []
+    warnings: list[str] = []
+    for index, answer in enumerate(answer_rows):
+        encoded = json.dumps(answer, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        response_key = hashlib.sha256(f"{round_id}:{index}:{encoded}".encode()).hexdigest()[:12]
+        if response_key in existing_keys:
+            continue
+        reporter_name = str(answer.get("reporter_name", "")).strip()
+        title = str(answer.get("issue_title", "")).strip()
+        description = str(answer.get("issue_description", "")).strip()
+        project_id = projects_by_label.get(answer.get("project"))
+        if not reporter_name or not title or not description:
+            warnings.append(f"Response {index + 1} is missing its name, issue title, or description")
+            continue
+        if project_id not in current["projects"]:
+            warnings.append(f"Response {index + 1} selected a project that is no longer available")
+            continue
+        urls_text = str(answer.get("related_urls", ""))
+        related_urls = [part.strip() for line in urls_text.splitlines() for part in line.split(",") if part.strip()]
+        feature_id = f"intake-feature-{response_key}"
+        task_id = f"intake-task-{response_key}"
+        reporter_email = str(answer.get("reporter_email", "")).strip() or None
+        if feature_id not in current["features"]:
+            feature_data = {"feature_id": feature_id, "project_id": project_id, "title": title,
+                "status": "planned", "assignee_id": None, "source": "public_issue_intake",
+                "intake_round": round_id, "intake_response_key": response_key}
+            append_event(root, "feature.created", feature_data)
+            feature_dir = root / "projects" / project_id / "features" / feature_id
+            feature_dir.mkdir(parents=True, exist_ok=True)
+            safe_title = " ".join(title.splitlines()).strip()
+            readme_lines = [f"# {safe_title}", "", "## Report", "", *[f"> {line}" for line in description.splitlines()]]
+            if related_urls:
+                readme_lines.extend(["", "## References", "", *[f"- {url}" for url in related_urls]])
+            (feature_dir / "README.md").write_text("\n".join(readme_lines) + "\n")
+            (feature_dir / "images").mkdir(exist_ok=True)
+            current["features"][feature_id] = feature_data
+        if task_id not in current["tasks"]:
+            task_data = {"task_id": task_id, "feature_id": feature_id, "title": title, "kind": "other",
+                "assignee_id": None, "status": "open", "description": description, "related_urls": related_urls,
+                "reported_by": reporter_name, "reporter_email": reporter_email,
+                "source": "public_issue_intake", "intake_round": round_id, "intake_response_key": response_key}
+            append_event(root, "task.created", task_data)
+            current["tasks"][task_id] = task_data
+        append_event(root, "issue_report.ingested", {"intake_round": round_id, "response_key": response_key,
+            "project_id": project_id, "feature_id": feature_id, "task_id": task_id})
+        existing_keys.add(response_key)
+        ingested.append({"feature_id": feature_id, "task_id": task_id, "project_id": project_id})
+    applied = {"round_id": round_id, "report_count": len(ingested), "reports": ingested,
+        "warnings": warnings, "applied_at": datetime.now(UTC).isoformat()}
+    applied_path.write_text(json.dumps(applied, indent=2) + "\n")
+    append_event(root, "issue_intake.applied", {"round_id": round_id, "report_count": len(ingested)})
+    emit("tracker intake apply", {**applied,
+        "next_steps": ["Review new unassigned work with `tracker task list --status open` or `tracker memo build`."]})
+
+
 @updates_group.command("prepare")
 @click.option("--id", "round_id", required=True)
 @click.pass_context
@@ -1040,7 +1230,7 @@ def survey_group() -> None:
 
 
 @survey_group.command("list")
-@click.option("--type", "survey_type", type=click.Choice(["task_status_update", "task_assignment"]))
+@click.option("--type", "survey_type", type=click.Choice(["task_status_update", "task_assignment", "issue_report"]))
 @click.pass_context
 def survey_list(ctx: click.Context, survey_type: str | None) -> None:
     """List survey rounds and their local lifecycle status, without showing private links."""
@@ -1048,6 +1238,7 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
     definitions = {
         "updates": ("task_status_update", "updates"),
         "assignments": ("task_assignment", "assignments"),
+        "intake": ("issue_report", "intake"),
     }
     rounds: dict[tuple[str, str], dict[str, Any]] = {}
     warnings: list[str] = []
@@ -1056,6 +1247,8 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         "updates.collected": "updates", "updates.applied": "updates",
         "assignments.prepared": "assignments", "assignments.deployed": "assignments",
         "assignments.collected": "assignments", "assignments.applied": "assignments",
+        "issue_intake.prepared": "intake", "issue_intake.deployed": "intake",
+        "issue_intake.collected": "intake", "issue_intake.applied": "intake",
     }
     for event in events(root):
         survey_family = event_to_type.get(event["kind"])
@@ -1102,9 +1295,11 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
                     surveys = prepared.get("surveys", {})
                     summary["people_count"] = len(surveys)
                     summary["task_count"] = sum(len(item.get("questions", {}).get("assigned", {})) for item in surveys.values())
-                else:
+                elif family == "assignments":
                     summary["reviewer_id"] = prepared.get("reviewer_id")
                     summary["task_count"] = len(prepared.get("tasks", {}))
+                else:
+                    summary["project_count"] = len(prepared.get("project_choices", {}))
             except (OSError, json.JSONDecodeError) as exc:
                 stage = summary["stage"] = "incomplete"
                 warnings.append(f"Could not read {display_type} round {round_id}: {exc}")
@@ -1114,6 +1309,12 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
                 summary["outcome_counts"] = applied_summary.get("outcome_counts", {})
             except (OSError, json.JSONDecodeError) as exc:
                 warnings.append(f"Could not read assignment outcomes for round {round_id}: {exc}")
+        if family == "intake" and applied:
+            try:
+                applied_summary = json.loads((private_dir / "applied.json").read_text())
+                summary["report_count"] = applied_summary.get("report_count", 0)
+            except (OSError, json.JSONDecodeError) as exc:
+                warnings.append(f"Could not read issue-report outcomes for round {round_id}: {exc}")
         summaries.append(summary)
     if survey_type:
         summaries = [item for item in summaries if item["type"] == survey_type]
@@ -1135,10 +1336,15 @@ def survey_guide() -> None:
          "commands": ["tracker assignments prepare --id <round-id> --reviewer <person-id>",
                       "tracker assignments deploy <round-id>", "tracker assignments collect <round-id>",
                       "tracker assignments apply <round-id>"]},
+        {"type": "issue_report", "audience": "Anyone with the public respondent URL.",
+         "collects": "Reporter name, optional email, project, issue title and description, and optional relevant URLs. Each valid report creates a feature and an unassigned task.",
+         "commands": ["tracker intake prepare --id <round-id>", "tracker intake deploy <round-id>",
+                      "tracker intake collect <round-id>", "tracker intake apply <round-id>"]},
     ], "lifecycle": ["prepare and review the local EDSL survey artifact", "deploy explicitly to create live Humanize links",
-        "send each private link to its intended respondent", "collect responses into .tracker/private/",
+        "share each private link with its respondent or the public issue-report link intentionally",
+        "collect responses into .tracker/private/",
         "apply responses to append tracker events"],
-        "privacy": "Survey respondent URLs and raw Results artifacts are kept under the gitignored .tracker/private/ directory.",
+        "privacy": "Private survey respondent URLs and raw Results artifacts are kept under gitignored .tracker/private/. Issue-report URLs are public and reusable; reports become team-visible when applied.",
         "next_steps": ["Run `tracker survey list` to inspect existing rounds."]})
 
 

@@ -28,6 +28,11 @@ repositories linked from projects here.
 
 - Use `tracker survey guide` to explain status-update and assignment surveys;
   use `tracker survey list` to show existing rounds and lifecycle stages.
+- The status-update survey is personalized for each active engineer and covers
+  their active assigned tasks. Public issue intake uses `tracker intake
+  prepare/deploy/collect/apply`; tell respondents reports become team-visible
+  when applied. Intake creates a feature and an unassigned task per valid
+  report. Its reusable respondent URL and raw results stay in `.tracker/private/`.
 - `tracker updates prepare` builds local EDSL survey artifacts. Review them
   before fielding.
 - `tracker updates deploy` creates live Humanize surveys. Do this only when the
@@ -44,6 +49,9 @@ repositories linked from projects here.
   `tracker assignments` commands. The merge keeps the original task in history
   and records its surviving task ID. Probable completion requires verification;
   it does not mark the task done.
+- `tracker intake deploy` creates a public, reusable issue-report URL. Share it
+  intentionally. Collect results privately, review them, and apply them to
+  append one feature and unassigned task per valid report.
 
 ## Daily review
 

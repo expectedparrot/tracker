@@ -41,7 +41,7 @@ under `.tracker/events/`, one event per file, which keeps concurrent Git changes
 from colliding on a shared JSONL file. Commit and share the tracker repository
 with the same review workflow used for code.
 
-## Humanize updates
+## Humanize surveys
 
 Install the optional EDSL integration with `uv tool install --editable '.[fielding]'`.
 An update round creates a personalized survey for every active team member,
@@ -61,6 +61,11 @@ tracker assignments prepare --id allocation-2026-11-22 --reviewer alex
 tracker assignments deploy allocation-2026-11-22
 tracker assignments collect allocation-2026-11-22
 tracker assignments apply allocation-2026-11-22
+tracker intake prepare --id public-issues
+tracker intake deploy public-issues
+# Share the public respondent URL wherever people can report issues.
+tracker intake collect public-issues
+tracker intake apply public-issues
 ```
 
 Deployment is a separate command because it creates live Humanize surveys.
@@ -72,13 +77,21 @@ records a merge link for merged tasks, and leaves deferred tasks open.
 the task done. Review those tasks with `tracker status`, then confirm with
 `tracker task status <task-id> done` or return them to `open`.
 
+The issue-report survey is public and reusable. It asks for a name, project,
+issue title and description, plus optional email and relevant URLs. Tell
+respondents that reports become visible to the team when applied. `collect`
+stores raw results privately; `apply` creates one feature and one unassigned
+task per valid report, including a feature README with the report and links.
+Only share the respondent URL after explicitly deploying the form.
+
 `tracker memo build` creates an immutable dated Markdown snapshot. If the team
 needs another snapshot for the same date, choose a new date; existing memo files
 are not overwritten.
 
 ## Survey catalog
 
-Use `tracker survey list` to see status-update and task-allocation rounds and
-whether each is prepared, deployed, collected, or applied. It does not print
-respondent links. Run `tracker survey guide` for each survey's audience,
-questions, and exact lifecycle commands.
+Use `tracker survey list` to see status-update, task-allocation, and public
+issue-report rounds and whether each is prepared, deployed, collected, or
+applied. It does not print respondent links. Run `tracker survey guide` for
+each survey's audience, questions, and exact lifecycle commands. The engineer
+status survey is personalized and covers that engineer's active assigned tasks.
