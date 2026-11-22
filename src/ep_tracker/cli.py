@@ -161,6 +161,11 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         stage, recommendation = "review-assignments", "Review pending task claims and assignment proposals."
         steps = ["Inspect requests with `tracker task requests`.",
                  "Resolve each request with `tracker task resolve-request <event-id> --decision accept|reject`."]
+    elif any(task.get("completion_suspected") for task in current["tasks"].values()):
+        stage, recommendation = "verify-completion", "Check tasks the assignment reviewer thinks may already be complete."
+        suspected_ids = [task["id"] for task in current["tasks"].values() if task.get("completion_suspected")]
+        steps = [f"Review suspected completions with `tracker task list` (task IDs: {', '.join(suspected_ids)}).",
+                 "After checking the work, confirm each with `tracker task status <task-id> done` or return it to `open`."]
     elif any(not task.get("assignee_id") and task.get("status") not in {"done", "cancelled"}
              for task in current["tasks"].values()):
         stage, recommendation = "unassigned-work", "Prepare an assignment survey for the unassigned tasks."
@@ -202,7 +207,9 @@ def status_command(ctx: click.Context) -> None:
         key = item.get("status", "open")
         task_counts[key] = task_counts.get(key, 0) + 1
     emit("tracker status", {"team": read_config(root), "feature_counts": feature_counts,
-        "task_counts": task_counts, "unassigned_tasks": [item for item in current["tasks"].values() if not item.get("assignee_id")],
+        "task_counts": task_counts, "unassigned_tasks": [item for item in current["tasks"].values()
+            if not item.get("assignee_id") and item.get("status") not in {"done", "cancelled", "merged"}],
+        "completion_suspected": [item for item in current["tasks"].values() if item.get("completion_suspected")],
         "assignment_requests": current["assignment_requests"]})
 
 
@@ -446,6 +453,10 @@ def task_assign(ctx: click.Context, task_id: str, person_id: str | None) -> None
     root = root_or_fail("tracker task assign", ctx.obj["directory"])
     current = state(root)
     check_id(task_id, current["tasks"], "task")
+    if current["tasks"][task_id].get("status") == "merged":
+        raise TrackerError(f"Task {task_id} was merged into another task and cannot be reassigned")
+    if current["tasks"][task_id].get("completion_suspected"):
+        raise TrackerError(f"Verify whether task {task_id} is complete before assigning it")
     if person_id:
         check_id(person_id, current["people"], "person")
     append_event(root, "task.assigned", {"task_id": task_id, "person_id": person_id})
@@ -459,7 +470,10 @@ def task_assign(ctx: click.Context, task_id: str, person_id: str | None) -> None
 @click.pass_context
 def task_status(ctx: click.Context, task_id: str, status: str, update: str | None) -> None:
     root = root_or_fail("tracker task status", ctx.obj["directory"])
-    check_id(task_id, state(root)["tasks"], "task")
+    current = state(root)
+    check_id(task_id, current["tasks"], "task")
+    if current["tasks"][task_id].get("status") == "merged":
+        raise TrackerError(f"Task {task_id} was merged into another task; update the surviving task instead")
     append_event(root, "task.status_changed", {"task_id": task_id, "status": status, "update": update})
     emit("tracker task status", {"task_id": task_id, "status": status, "update": update})
 
@@ -586,9 +600,10 @@ def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> 
     if not engineers:
         raise TrackerError("Add or activate at least one person with the engineer role")
     unassigned = [task for task in current["tasks"].values()
-                  if not task.get("assignee_id") and task.get("status") not in {"done", "cancelled"}]
+                  if not task.get("assignee_id") and task.get("status") not in {"done", "cancelled", "merged"}
+                  and not task.get("completion_suspected")]
     if not unassigned:
-        raise TrackerError("There are no active unassigned tasks to include in an assignment survey")
+        raise TrackerError("There are no eligible unassigned tasks; verify suspected completions first")
     directory = root / ".tracker" / "assignments" / round_id
     if directory.exists():
         raise TrackerError(f"Assignment round already exists: {round_id}")
@@ -596,17 +611,41 @@ def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> 
     questions: list[Any] = []
     task_map: dict[str, Any] = {}
     for index, task in enumerate(unassigned):
-        question_name = f"assignment_{index:04d}"
+        action_name = f"assignment_{index:04d}_action"
+        engineer_name = f"assignment_{index:04d}_engineer"
+        merge_name = f"assignment_{index:04d}_merge_target"
         feature = current["features"].get(task["feature_id"], {})
-        choices = {"Leave unassigned": None}
+        source_project_id = feature.get("project_id")
+        active_tasks = [candidate for candidate in current["tasks"].values()
+            if candidate.get("status") not in {"done", "cancelled", "merged"}
+            and not candidate.get("completion_suspected")
+            and current["features"].get(candidate["feature_id"], {}).get("project_id") == source_project_id]
+        engineer_choices = {"No engineer selected": None}
         for person in engineers:
             label = f"{person['id']} — {person.get('display_name', person['id'])}"
-            choices[label] = person["id"]
-        questions.append(QuestionMultipleChoice(question_name=question_name,
-            question_text=(f"{task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}; "
-                           f"kind {task['kind']}; status {task.get('status', 'open')}). Choose an engineer."),
-            question_options=list(choices)))
-        task_map[task["id"]] = {"question": question_name, "choices": choices}
+            engineer_choices[label] = person["id"]
+        merge_targets = [candidate for candidate in active_tasks
+                         if candidate["id"] != task["id"] and not candidate.get("completion_suspected")]
+        merge_choices = {"No merge target selected": None}
+        for target in merge_targets:
+            target_feature = current["features"].get(target["feature_id"], {})
+            target_label = f"{target['id']} — {target['title']} (feature {target_feature.get('title', target['feature_id'])})"
+            merge_choices[target_label] = target["id"]
+        actions = ["Assign to engineer", "Leave unassigned", "Probably already completed?"]
+        if merge_targets:
+            actions.append("Merge into another issue")
+        context = (f"{task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}; "
+                   f"kind {task['kind']}; status {task.get('status', 'open')}).")
+        questions.append(QuestionMultipleChoice(question_name=action_name,
+            question_text=f"{context} What should happen to this unassigned issue?", question_options=actions))
+        questions.append(QuestionMultipleChoice(question_name=engineer_name,
+            question_text="If assigning this issue, choose an engineer; otherwise choose no selection.",
+            question_options=list(engineer_choices)))
+        questions.append(QuestionMultipleChoice(question_name=merge_name,
+            question_text="If merging this issue, choose the surviving issue; otherwise choose no selection.",
+            question_options=list(merge_choices)))
+        task_map[task["id"]] = {"action_question": action_name, "engineer_question": engineer_name,
+            "engineer_choices": engineer_choices, "merge_question": merge_name, "merge_choices": merge_choices}
     survey = Survey(questions)
     survey_path = directory / "assignments.survey.ep"
     saved = survey.git.save(str(survey_path), message=f"Prepare task assignment survey {round_id}")
@@ -645,10 +684,14 @@ def assignments_deploy(ctx: click.Context, round_id: str) -> None:
     prepared = json.loads(prepared_path.read_text())
     reviewer = state(root)["people"][prepared["reviewer_id"]]
     survey = Survey.git.load(str(root / prepared["survey_path"]))
+    optional_questions = {}
+    for item in prepared["tasks"].values():
+        optional_questions[item["engineer_question"]] = {"optional": True}
+        optional_questions[item["merge_question"]] = {"optional": True}
     try:
         info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} task allocation {round_id}",
             survey_description=f"Assign unassigned team tasks; reviewer: {reviewer.get('display_name', reviewer['id'])}.",
-            survey_visibility="private")
+            survey_visibility="private", humanize_schema={"questions": optional_questions})
     except Exception as exc:
         raise TrackerError(f"Humanize deployment failed for assignment round {round_id}: {exc}") from exc
     deployment = {key: info[key] for key in ("uuid", "respondent_url", "preview_url", "admin_url") if key in info}
@@ -713,40 +756,87 @@ def assignments_apply(ctx: click.Context, round_id: str) -> None:
     reviewer = current["people"].get(prepared["reviewer_id"])
     if reviewer is None or not reviewer.get("active", True):
         raise TrackerError(f"Reviewer {prepared['reviewer_id']} is no longer active")
-    existing_assignments = {event["data"].get("task_id"): event["data"].get("person_id")
-        for event in events(root) if event["kind"] == "task.assigned" and event["data"].get("assignment_round") == round_id}
-    applied: list[dict[str, str]] = [{"task_id": task_id, "person_id": person_id}
-        for task_id, person_id in existing_assignments.items() if person_id]
+    outcome_kinds = {"task.assigned": "assigned", "task.completion_suspected": "probably_completed",
+        "task.merged": "merged", "task.assignment_deferred": "left_unassigned"}
+    existing_outcomes = [event for event in events(root)
+        if event["kind"] in outcome_kinds and event["data"].get("assignment_round") == round_id]
+    existing_task_ids = {event["data"].get("task_id") for event in existing_outcomes}
+    outcomes = [{"task_id": event["data"]["task_id"], "disposition": outcome_kinds[event["kind"]],
+        **({"person_id": event["data"].get("person_id")} if event["kind"] == "task.assigned" else {}),
+        **({"target_task_id": event["data"].get("target_task_id")} if event["kind"] == "task.merged" else {})}
+        for event in existing_outcomes]
+    current_tasks = state(root)["tasks"]
     warnings: list[str] = []
     for task_id, item in prepared["tasks"].items():
-        if task_id in existing_assignments:
+        if task_id in existing_task_ids:
             continue
-        task = current["tasks"].get(task_id)
+        task = current_tasks.get(task_id)
         if task is None:
             warnings.append(f"Task {task_id} no longer exists")
             continue
         if task.get("assignee_id"):
             warnings.append(f"Task {task_id} has been assigned since the survey was prepared")
             continue
-        choice = answer.get(item["question"])
-        person_id = item["choices"].get(choice)
-        if person_id is None:
+        if "action_question" not in item:
+            # Read assignment surveys prepared by the first tracker release.
+            person_id = item.get("choices", {}).get(answer.get(item.get("question")))
+            action = "Assign to engineer" if person_id else "Leave unassigned"
+        else:
+            action = answer.get(item["action_question"])
+            person_id = item.get("engineer_choices", {}).get(answer.get(item["engineer_question"]))
+        outcome: dict[str, Any] | None = None
+        if action == "Assign to engineer":
+            person = current["people"].get(person_id)
+            if person is None or not person.get("active", True) or person.get("role", "engineer").lower() != "engineer":
+                warnings.append(f"Selected engineer {person_id} is no longer active or has a different role")
+                continue
+            append_event(root, "task.assigned", {"task_id": task_id, "person_id": person_id,
+                "assigned_by": prepared["reviewer_id"], "source": "humanize_assignment_survey", "assignment_round": round_id})
+            current_tasks[task_id]["assignee_id"] = person_id
+            outcome = {"task_id": task_id, "disposition": "assigned", "person_id": person_id}
+        elif action == "Probably already completed?":
+            append_event(root, "task.completion_suspected", {"task_id": task_id,
+                "reviewer_id": prepared["reviewer_id"], "assignment_round": round_id})
+            current_tasks[task_id]["completion_suspected"] = True
+            outcome = {"task_id": task_id, "disposition": "probably_completed"}
+        elif action == "Merge into another issue":
+            target_id = item.get("merge_choices", {}).get(answer.get(item["merge_question"]))
+            target = current_tasks.get(target_id)
+            if target is None or target_id == task_id or target.get("status") in {"done", "cancelled", "merged"}:
+                warnings.append(f"No valid surviving issue was selected for task {task_id}")
+                continue
+            source_project_id = current["features"].get(task["feature_id"], {}).get("project_id")
+            target_project_id = current["features"].get(target["feature_id"], {}).get("project_id")
+            if source_project_id != target_project_id:
+                warnings.append(f"Cannot merge task {task_id} into a task in another project")
+                continue
+            append_event(root, "task.merged", {"task_id": task_id, "target_task_id": target_id,
+                "reviewer_id": prepared["reviewer_id"], "assignment_round": round_id})
+            current_tasks[task_id]["status"] = "merged"
+            current_tasks[task_id]["merged_into"] = target_id
+            outcome = {"task_id": task_id, "disposition": "merged", "target_task_id": target_id}
+        elif action == "Leave unassigned":
+            append_event(root, "task.assignment_deferred", {"task_id": task_id,
+                "reviewer_id": prepared["reviewer_id"], "assignment_round": round_id})
+            outcome = {"task_id": task_id, "disposition": "left_unassigned"}
+        else:
+            warnings.append(f"No valid disposition was selected for task {task_id}")
             continue
-        person = current["people"].get(person_id)
-        if person is None or not person.get("active", True):
-            warnings.append(f"Selected engineer {person_id} is no longer active")
-            continue
-        append_event(root, "task.assigned", {"task_id": task_id, "person_id": person_id,
-            "assigned_by": prepared["reviewer_id"], "source": "humanize_assignment_survey", "assignment_round": round_id})
-        applied.append({"task_id": task_id, "person_id": person_id})
+        outcomes.append(outcome)
+        existing_task_ids.add(task_id)
     final_state = state(root)
-    result = {"round_id": round_id, "reviewer_id": prepared["reviewer_id"], "assignments": applied,
+    assignments = [item for item in outcomes if item["disposition"] == "assigned"]
+    result = {"round_id": round_id, "reviewer_id": prepared["reviewer_id"], "assignments": assignments,
+        "outcomes": outcomes,
+        "outcome_counts": {disposition: sum(item["disposition"] == disposition for item in outcomes)
+            for disposition in ("assigned", "left_unassigned", "probably_completed", "merged")},
         "unassigned_count": sum(1 for task_id in prepared["tasks"]
-            if task_id in final_state["tasks"] and not final_state["tasks"][task_id].get("assignee_id")),
+            if task_id in final_state["tasks"] and not final_state["tasks"][task_id].get("assignee_id")
+            and final_state["tasks"][task_id].get("status") not in {"done", "cancelled", "merged"}),
         "warnings": warnings, "applied_at": datetime.now(UTC).isoformat()}
     applied_path.write_text(json.dumps(result, indent=2) + "\n")
     append_event(root, "assignments.applied", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
-        "assignments": applied, "unassigned_count": result["unassigned_count"]})
+        "assignments": assignments, "outcomes": outcomes, "unassigned_count": result["unassigned_count"]})
     emit("tracker assignments apply", {**result, "next_steps": ["Review ownership with `tracker status` or build a memo."]})
 
 
@@ -1018,6 +1108,12 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
             except (OSError, json.JSONDecodeError) as exc:
                 stage = summary["stage"] = "incomplete"
                 warnings.append(f"Could not read {display_type} round {round_id}: {exc}")
+        if family == "assignments" and applied:
+            try:
+                applied_summary = json.loads((private_dir / "applied.json").read_text())
+                summary["outcome_counts"] = applied_summary.get("outcome_counts", {})
+            except (OSError, json.JSONDecodeError) as exc:
+                warnings.append(f"Could not read assignment outcomes for round {round_id}: {exc}")
         summaries.append(summary)
     if survey_type:
         summaries = [item for item in summaries if item["type"] == survey_type]
@@ -1035,7 +1131,7 @@ def survey_guide() -> None:
          "commands": ["tracker updates prepare --id <round-id>", "tracker updates deploy <round-id>",
                       "tracker updates collect <round-id>", "tracker updates apply <round-id>"]},
         {"type": "task_assignment", "audience": "One named reviewer gets a survey containing all active unassigned tasks.",
-         "collects": "One engineer choice per task, or Leave unassigned.",
+         "collects": "For each task, assign an engineer, leave it unassigned, flag it as probably complete for verification, or merge it into a selected surviving issue.",
          "commands": ["tracker assignments prepare --id <round-id> --reviewer <person-id>",
                       "tracker assignments deploy <round-id>", "tracker assignments collect <round-id>",
                       "tracker assignments apply <round-id>"]},
@@ -1083,6 +1179,10 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
             lines.extend([f"#### {heading}", ""])
             for task in tasks:
                 lines.append(f"- {task['title']} (`{task['id']}`, {task['kind']}) — feature `{task['feature_id']}`")
+                if task.get("completion_suspected"):
+                    lines.append("  - Reviewer thinks this may already be complete; verify before closing or assigning it.")
+                if task.get("merged_into"):
+                    lines.append(f"  - Merged into task `{task['merged_into']}`.")
                 if task.get("latest_update"):
                     lines.append(f"  - Update from {task.get('reported_by', 'team member')}: {task['latest_update']}")
         lines.append("")

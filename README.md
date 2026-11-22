@@ -47,7 +47,9 @@ Install the optional EDSL integration with `uv tool install --editable '.[fieldi
 An update round creates a personalized survey for every active team member,
 asking for status and notes on that person's assigned tasks. Unassigned work has
 a separate allocation survey for one named reviewer; it lists every active
-unassigned task with the active engineers as choices.
+unassigned task and lets the reviewer assign it, leave it open, flag it as
+probably complete for verification, or merge it into another active issue in
+the same project.
 
 ```bash
 tracker updates prepare --id 2026-11-22
@@ -64,8 +66,11 @@ tracker assignments apply allocation-2026-11-22
 Deployment is a separate command because it creates live Humanize surveys.
 Survey links and raw responses are stored under `.tracker/private/`, which the
 CLI adds to `.gitignore`. Applying status responses appends reported task
-statuses and notes. Applying an assignment response assigns the selected
-engineer directly and leaves tasks marked “Leave unassigned” untouched.
+statuses and notes. An assignment response assigns the selected engineer,
+records a merge link for merged tasks, and leaves deferred tasks open.
+“Probably already completed?” flags the task for verification; it does not mark
+the task done. Review those tasks with `tracker status`, then confirm with
+`tracker task status <task-id> done` or return them to `open`.
 
 `tracker memo build` creates an immutable dated Markdown snapshot. If the team
 needs another snapshot for the same date, choose a new date; existing memo files

@@ -25,7 +25,10 @@ not edit tracker JSON files directly.
    round. Send each respondent URL only to its intended person.
 7. For unassigned work, use `tracker assignments prepare --id <round>
    --reviewer <person>` to create one allocation survey listing all unassigned
-   tasks and all active engineers. Only an authorized reviewer should apply it.
+   tasks and active engineers. The reviewer can assign, defer, flag probable
+   completion for verification, or merge a duplicate into another active issue
+   in the same project. Only an authorized reviewer should apply it; probable
+   completion is not closure.
 
 ## Implementing changes in this Python repo
 

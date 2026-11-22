@@ -37,10 +37,13 @@ repositories linked from projects here.
   status and records notes.
 - For unassigned work, choose a reviewer and prepare one allocation survey:
   `tracker assignments prepare --id <round-id> --reviewer <person-id>`. It lists
-  every unassigned task and offers each active engineer as an assignment choice.
+  every unassigned task and lets the reviewer assign an engineer, defer it, flag
+  probable completion for verification, or merge it into another active issue
+  in the same project.
 - Deploy, collect, and apply an assignment round using the matching
-  `tracker assignments` commands. This records the reviewer's selected owner;
-  tasks marked “Leave unassigned” remain unassigned.
+  `tracker assignments` commands. The merge keeps the original task in history
+  and records its surviving task ID. Probable completion requires verification;
+  it does not mark the task done.
 
 ## Daily review
 

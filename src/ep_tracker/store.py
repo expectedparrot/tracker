@@ -82,10 +82,24 @@ def state(root: Path) -> dict[str, Any]:
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
             if kind == "task.status_changed":
                 task["status"] = data["status"]
+                task["completion_suspected"] = False
                 if data.get("update"):
                     task["latest_update"] = data["update"]
             else:
                 task["assignee_id"] = data.get("person_id")
+        elif kind == "task.completion_suspected":
+            task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
+            task["completion_suspected"] = True
+            task["completion_suspected_by"] = data.get("reviewer_id")
+            task["completion_suspected_round"] = data.get("assignment_round")
+        elif kind == "task.merged":
+            task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
+            task["status"] = "merged"
+            task["merged_into"] = data["target_task_id"]
+            task["merged_by"] = data.get("reviewer_id")
+        elif kind == "task.assignment_deferred":
+            task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
+            task["last_assignment_review"] = data.get("assignment_round")
         elif kind == "task.update_reported":
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
             task["latest_update"] = data.get("note")
