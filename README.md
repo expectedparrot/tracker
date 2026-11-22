@@ -84,6 +84,120 @@ Every command emits one JSON envelope to stdout. Event files are stored one per
 file to avoid concurrent Git changes colliding on a shared JSONL file. Commit
 and share the tracker repository with the same review workflow used for code.
 
+## Everyday CLI commands
+
+The CLI is organized by the kind of object being changed. IDs are stable
+team-chosen names used by later commands. Commands append events; for example,
+changing a task's status adds a new status event and leaves the earlier event
+in history.
+
+### People and projects
+
+```bash
+# Add an engineer (the default role).
+tracker person add --id alex --name "Alex Kim" --github alexkim
+
+# Add a reviewer who can run allocation surveys but is not offered as an engineer.
+tracker person add --id sam --name "Sam Lee" --role reviewer
+
+# Update profile information or deactivate someone without deleting history.
+tracker person update alex --email alex@example.com
+tracker person deactivate sam
+tracker person list
+
+# A project can track several code repositories.
+tracker project add --id billing --name "Billing"
+tracker project repo --id billing-api --project billing --url https://github.com/acme/billing-api
+tracker project repo --id billing-web --project billing --url https://github.com/acme/billing-web
+tracker project list
+```
+
+### Features, tasks, and pull requests
+
+```bash
+# Create a feature; this also creates its README.md and images/ folder.
+tracker feature create --id saved-cards --project billing --title "Saved cards"
+
+# Add build and review work. The feature is optional for tasks.
+tracker task create --id saved-cards-build --feature saved-cards \
+  --title "Implement saved cards" --kind build --assignee alex
+tracker task create --id saved-cards-review --feature saved-cards \
+  --title "Review the API change" --kind review
+
+# Create a standalone task, optionally grouped under a project.
+tracker task create --id rotate-keys --project billing \
+  --title "Rotate API keys" --kind other
+tracker task create --id review-runbook --title "Review incident runbook" --kind approve
+
+# Link PRs from any repository in the feature's project.
+tracker feature pr saved-cards --repo billing-api \
+  --url https://github.com/acme/billing-api/pull/42 --number 42
+tracker feature pr saved-cards --repo billing-web \
+  --url https://github.com/acme/billing-web/pull/18 --number 18
+
+# Inspect work or filter lists.
+tracker feature list --project billing
+tracker task list --assignee alex
+tracker task list --status blocked
+```
+
+`--kind` can be `build`, `review`, `approve`, or `other`. Tasks start as
+`open`; features start as `planned`. A task with `--feature` inherits the
+feature's project. A task without a feature may use `--project`, or can be
+fully standalone.
+
+### Assign and update work directly
+
+For one-off changes, use task commands. To allocate many unassigned tasks in
+one review, use the assignment survey below.
+
+```bash
+# Assign a task or remove its assignment by omitting the person ID.
+tracker task assign rotate-keys alex
+tracker task assign rotate-keys
+
+# Append a status change and an optional note.
+tracker task status rotate-keys in_progress --update "Coordinating key rotation"
+tracker task status rotate-keys blocked --update "Waiting on the vendor"
+tracker task status rotate-keys done
+
+# Feature status is tracked separately from task status.
+tracker feature status saved-cards in_progress
+tracker feature assign saved-cards alex
+
+# Review the aggregate state, or inspect recent events.
+tracker status
+tracker history --limit 20
+```
+
+Task statuses are `open`, `in_progress`, `blocked`, `done`, and `cancelled`;
+feature statuses are `planned`, `in_progress`, `blocked`, `done`, and
+`cancelled`. Merged tasks are marked by the assignment workflow and point to a
+surviving task.
+
+### Reading command output
+
+Commands print one JSON object to standard output, so agents can inspect or
+pipe results. A typical response has this shape (the `data` fields depend on
+the command):
+
+```json
+{
+  "schema_version": "1.0",
+  "command": "tracker task list",
+  "status": "ok",
+  "data": {"tasks": []},
+  "artifacts": [],
+  "warnings": [],
+  "errors": [],
+  "next_steps": []
+}
+```
+
+Validation failures use `status: "error"` and include a structured error
+instead of changing tracker state. Use `tracker guide`, `tracker survey guide`,
+and `tracker --help` for built-in command guidance.
+
 ## A team's regular workflow
 
 1. Run `tracker agent next` for state-aware guidance, or `tracker status` for a
