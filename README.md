@@ -175,6 +175,51 @@ feature statuses are `planned`, `in_progress`, `blocked`, `done`, and
 `cancelled`. Merged tasks are marked by the assignment workflow and point to a
 surviving task.
 
+### Go through repos to find PR review requests
+
+Use the repositories registered with a project as the review sweep list. The
+tracker stores repository URLs and PR links; GitHub CLI finds review requests
+and submits the actual review. The tracker does not scan GitHub automatically.
+Authenticate `gh` first and make sure your account can access each repository.
+
+```bash
+# Find the project's repositories and their GitHub URLs.
+tracker project list
+
+# Check each repo for open PRs requesting your review.
+gh pr list --repo acme/billing-api --review-requested @me
+gh pr list --repo acme/billing-web --review-requested @me
+
+# Inspect the request and patch before reviewing.
+gh pr view 42 --repo acme/billing-api
+gh pr diff 42 --repo acme/billing-api
+```
+
+For a PR that belongs to a tracked feature, link it to that feature and create
+a review task assigned to yourself. The task will then appear in your engineer
+status survey and in the daily memo:
+
+```bash
+tracker feature pr saved-cards --repo billing-api \
+  --url https://github.com/acme/billing-api/pull/42 --number 42
+tracker task create --id saved-cards-pr-42-review --feature saved-cards \
+  --title "Review PR #42: saved cards API" --kind review --assignee alex
+
+# After completing the review in GitHub, update the tracker task.
+gh pr review 42 --repo acme/billing-api --approve
+tracker task status saved-cards-pr-42-review done --update "Approved PR #42"
+```
+
+Use `gh pr review ... --request-changes --body "..."` when requesting changes,
+then leave the tracker task open or blocked with a short note until the author
+updates the PR. If a review task is already in the tracker, update that task
+instead of creating a duplicate. PR links are attached to features, so create
+or choose a feature when you want the PR represented in the tracker.
+
+See GitHub CLI's [`gh pr list`](https://cli.github.com/manual/gh_pr_list) and
+[`gh pr review`](https://cli.github.com/manual/gh_pr_review) references for
+additional options.
+
 ### Reading command output
 
 Commands print one JSON object to standard output, so agents can inspect or
