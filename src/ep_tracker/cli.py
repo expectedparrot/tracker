@@ -1057,13 +1057,17 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
         for index, task in enumerate(assigned):
             status_name, note_name = f"assigned_status_{index:03d}", f"assigned_note_{index:03d}"
             feature = current["features"].get(task["feature_id"], {})
+            current_status = task.get("status", "open")
+            status_options = [f"Keep current status ({current_status})"] + [
+                status for status in ("open", "in_progress", "blocked", "done") if status != current_status]
             questions.append(QuestionMultipleChoice(question_name=status_name,
                 question_text=f"{task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}; "
-                              f"current status {task.get('status', 'open')}; {task['kind']}). What is its current status?",
-                question_options=["open", "in_progress", "blocked", "done"]))
+                              f"current status {current_status}; {task['kind']}). Keep this status or change it?",
+                question_options=status_options))
             questions.append(QuestionFreeText(question_name=note_name,
                 question_text="Progress update, blocker, or context (optional)."))
-            mapping["assigned"][task["id"]] = {"status": status_name, "note": note_name}
+            mapping["assigned"][task["id"]] = {"status": status_name, "note": note_name,
+                "current_status": current_status}
         questions.append(QuestionFreeText(question_name="general_update",
             question_text="Anything else the team should know about your work? (optional)"))
         survey = Survey(questions)
@@ -1211,13 +1215,17 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
                 continue
             status = answer.get(names["status"])
             note = str(answer.get(names["note"], "")).strip()
-            if status in {"open", "in_progress", "blocked", "done"}:
+            keep_status = f"Keep current status ({names.get('current_status', current['tasks'][task_id].get('status', 'open'))})"
+            current_status = current["tasks"][task_id].get("status", "open")
+            if status in {"open", "in_progress", "blocked", "done"} and status != current_status:
                 append_round_event("task.status_changed", task_id, person_id,
                     {"task_id": task_id, "status": status, "source": "humanize", "round_id": round_id, "reported_by": person_id})
-                if note and note.lower() not in {"none", "no update"}:
-                    append_round_event("task.update_reported", task_id, person_id,
-                        {"task_id": task_id, "note": note, "round_id": round_id, "reported_by": person_id})
                 summary["status_updates"] += 1
+            elif status not in {keep_status, current_status, "open", "in_progress", "blocked", "done"} and status is not None:
+                summary["warnings"].append(f"Ignoring unknown status response for task {task_id}")
+            if note and note.lower() not in {"none", "no update"}:
+                append_round_event("task.update_reported", task_id, person_id,
+                    {"task_id": task_id, "note": note, "round_id": round_id, "reported_by": person_id})
     applied = {"round_id": round_id, "applied_at": datetime.now(UTC).isoformat(), **summary}
     applied_path.write_text(json.dumps(applied, indent=2) + "\n")
     append_event(root, "updates.applied", {"round_id": round_id, "status_updates": summary["status_updates"]})
@@ -1328,7 +1336,7 @@ def survey_guide() -> None:
     """Explain survey types, their audiences, and their command workflows."""
     emit("tracker survey guide", {"survey_types": [
         {"type": "task_status_update", "audience": "Each active team member gets a personalized survey.",
-         "collects": "Status and optional progress or blocker notes for their active assigned tasks, plus an optional general update.",
+         "collects": "Shows the tracked status for each active assigned task and asks whether to keep it or change it, with optional progress or blocker notes and an optional general update.",
          "commands": ["tracker updates prepare --id <round-id>", "tracker updates deploy <round-id>",
                       "tracker updates collect <round-id>", "tracker updates apply <round-id>"]},
         {"type": "task_assignment", "audience": "One named reviewer gets a survey containing all active unassigned tasks.",

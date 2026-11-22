@@ -28,8 +28,9 @@ repositories linked from projects here.
 
 - Use `tracker survey guide` to explain status-update and assignment surveys;
   use `tracker survey list` to show existing rounds and lifecycle stages.
-- The status-update survey is personalized for each active engineer and covers
-  their active assigned tasks. Public issue intake uses `tracker intake
+- The status-update survey is personalized for each active engineer, shows
+  each active assigned task's current tracker status, and asks whether to keep
+  or change it. Public issue intake uses `tracker intake
   prepare/deploy/collect/apply`; tell respondents reports become team-visible
   when applied. Intake creates a feature and an unassigned task per valid
   report. Its reusable respondent URL and raw results stay in `.tracker/private/`.

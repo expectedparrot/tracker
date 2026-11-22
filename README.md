@@ -45,7 +45,9 @@ with the same review workflow used for code.
 
 Install the optional EDSL integration with `uv tool install --editable '.[fielding]'`.
 An update round creates a personalized survey for every active team member,
-asking for status and notes on that person's assigned tasks. Unassigned work has
+showing the tracker’s current status for each of that person’s active assigned
+tasks and asking whether to keep it or change it. Optional notes capture
+progress or blockers. Unassigned work has
 a separate allocation survey for one named reviewer; it lists every active
 unassigned task and lets the reviewer assign it, leave it open, flag it as
 probably complete for verification, or merge it into another active issue in
