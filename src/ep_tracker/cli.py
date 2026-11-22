@@ -109,7 +109,8 @@ def guide() -> None:
     """Describe the tracker lifecycle and important command boundaries."""
     emit("tracker guide", {"lifecycle": [
         "tracker init → people/projects/repos → features/tasks → daily memo",
-        "updates prepare → inspect survey artifacts → updates deploy → updates collect → review and apply responses",
+        "updates prepare → deploy → collect → apply task status updates",
+        "assignments prepare → deploy → collect → apply the reviewer's task assignments",
     ], "storage": "Team state is derived from immutable event files under .tracker/events/.",
         "agent_guidance": ["Run `tracker agent next` before acting and after each material change.",
             "Use CLI commands for state changes; do not edit tracker JSON or event files directly.",
@@ -161,9 +162,9 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
                  "Resolve each request with `tracker task resolve-request <event-id> --decision accept|reject`."]
     elif any(not task.get("assignee_id") and task.get("status") not in {"done", "cancelled"}
              for task in current["tasks"].values()):
-        stage, recommendation = "unassigned-work", "Assign the remaining active tasks or invite the team to claim them."
+        stage, recommendation = "unassigned-work", "Prepare an assignment survey for the unassigned tasks."
         steps = ["Review unassigned work with `tracker status`.",
-                 "Prepare a personalized update round with `tracker updates prepare --id <round-id>`."]
+                 "Choose an authorized reviewer, then run `tracker assignments prepare --id <round-id> --reviewer <person-id>`. "]
     else:
         today = date.today().isoformat()
         memo_exists = (root / "memos" / f"{today}.md").exists()
@@ -173,7 +174,7 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         else:
             stage, recommendation = "current", "Tracker state is current; review recent activity or start the next update round."
             steps = ["Inspect recent events with `tracker history`.",
-                     "Start the next personalized status round with `tracker updates prepare --id <round-id>`."]
+                     "Start the next status round with `tracker updates prepare --id <round-id>` or assignment round with `tracker assignments prepare --id <round-id> --reviewer <person-id>`. "]
     emit(command, {"stage": stage, "tracker": read_config(root), "counts": counts,
         "recommendation": recommendation, "next_steps": steps})
 
@@ -223,14 +224,15 @@ def person_group() -> None:
 @click.option("--name", "display_name", required=True)
 @click.option("--github")
 @click.option("--email")
+@click.option("--role", default="engineer", show_default=True, help="Team role; assignment surveys offer active engineers.")
 @click.pass_context
-def person_add(ctx: click.Context, person_id: str, display_name: str, github: str | None, email: str | None) -> None:
+def person_add(ctx: click.Context, person_id: str, display_name: str, github: str | None, email: str | None, role: str) -> None:
     root = root_or_fail("tracker person add", ctx.obj["directory"])
     validate_id(person_id, "Person ID")
     current = state(root)
     if person_id in current["people"]:
         fail("tracker person add", "person_exists", f"Person {person_id} already exists.", "Use `tracker person update` to add a new profile event.")
-    data = {"person_id": person_id, "display_name": display_name, "github": github, "email": email}
+    data = {"person_id": person_id, "display_name": display_name, "github": github, "email": email, "role": role}
     append_event(root, "person.created", data)
     emit("tracker person add", {"person": {**data, "active": True}})
 
@@ -247,15 +249,16 @@ def person_list(ctx: click.Context) -> None:
 @click.option("--name", "display_name")
 @click.option("--github")
 @click.option("--email")
+@click.option("--role")
 @click.pass_context
-def person_update(ctx: click.Context, person_id: str, display_name: str | None, github: str | None, email: str | None) -> None:
+def person_update(ctx: click.Context, person_id: str, display_name: str | None, github: str | None, email: str | None, role: str | None) -> None:
     root = root_or_fail("tracker person update", ctx.obj["directory"])
     person = state(root)["people"].get(person_id)
     if person is None:
         raise TrackerError(f"Unknown person ID: {person_id}")
-    changes = {key: value for key, value in {"display_name": display_name, "github": github, "email": email}.items() if value is not None}
+    changes = {key: value for key, value in {"display_name": display_name, "github": github, "email": email, "role": role}.items() if value is not None}
     if not changes:
-        raise TrackerError("Provide at least one of --name, --github, or --email")
+        raise TrackerError("Provide at least one of --name, --github, --email, or --role")
     append_event(root, "person.updated", {"person_id": person_id, **changes})
     emit("tracker person update", {"person": {**person, **changes}})
 
@@ -558,6 +561,194 @@ def response_answers(result_path: str, Results: Any) -> list[dict[str, Any]]:
             raise TrackerError(f"Could not read EDSL response package {result_path}: {results_error}; {scenario_error}") from scenario_error
 
 
+@main.group("assignments")
+def assignments_group() -> None:
+    """Prepare Humanize surveys that assign unassigned tasks to engineers."""
+
+
+@assignments_group.command("prepare")
+@click.option("--id", "round_id", required=True)
+@click.option("--reviewer", "reviewer_id", required=True, help="Person who will review and submit this survey.")
+@click.pass_context
+def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> None:
+    """Build one survey listing all unassigned tasks and available engineers."""
+    root = root_or_fail("tracker assignments prepare", ctx.obj["directory"])
+    _, QuestionMultipleChoice, _, Survey = edsl_types()
+    if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
+        raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
+    current = state(root)
+    check_id(reviewer_id, current["people"], "reviewer")
+    if not current["people"][reviewer_id].get("active", True):
+        raise TrackerError(f"Reviewer {reviewer_id} is inactive")
+    engineers = [person for person in current["people"].values()
+                 if person.get("active", True) and person.get("role", "engineer").lower() == "engineer"]
+    if not engineers:
+        raise TrackerError("Add or activate at least one person with the engineer role")
+    unassigned = [task for task in current["tasks"].values()
+                  if not task.get("assignee_id") and task.get("status") not in {"done", "cancelled"}]
+    if not unassigned:
+        raise TrackerError("There are no active unassigned tasks to include in an assignment survey")
+    directory = root / ".tracker" / "assignments" / round_id
+    if directory.exists():
+        raise TrackerError(f"Assignment round already exists: {round_id}")
+    directory.mkdir(parents=True)
+    questions: list[Any] = []
+    task_map: dict[str, Any] = {}
+    for index, task in enumerate(unassigned):
+        question_name = f"assignment_{index:04d}"
+        feature = current["features"].get(task["feature_id"], {})
+        choices = {"Leave unassigned": None}
+        for person in engineers:
+            label = f"{person['id']} — {person.get('display_name', person['id'])}"
+            choices[label] = person["id"]
+        questions.append(QuestionMultipleChoice(question_name=question_name,
+            question_text=(f"{task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}; "
+                           f"kind {task['kind']}; status {task.get('status', 'open')}). Choose an engineer."),
+            question_options=list(choices)))
+        task_map[task["id"]] = {"question": question_name, "choices": choices}
+    survey = Survey(questions)
+    survey_path = directory / "assignments.survey.ep"
+    saved = survey.git.save(str(survey_path), message=f"Prepare task assignment survey {round_id}")
+    Survey.git.load(saved["path"])
+    prepared = {"schema_version": "ep-tracker.assignment-round/1.0", "round_id": round_id,
+        "reviewer_id": reviewer_id, "created_at": datetime.now(UTC).isoformat(),
+        "survey_path": str(survey_path.relative_to(root)), "tasks": task_map}
+    (directory / "prepared.json").write_text(json.dumps(prepared, indent=2) + "\n")
+    append_event(root, "assignments.prepared", {"round_id": round_id, "reviewer_id": reviewer_id,
+        "task_ids": list(task_map)})
+    emit("tracker assignments prepare", {"round_id": round_id, "reviewer_id": reviewer_id,
+        "task_count": len(task_map), "survey_path": str(survey_path), "artifacts": [str(directory)],
+        "next_steps": ["Review the generated assignment survey.", f"Deploy it with `tracker assignments deploy {round_id}`."]})
+
+
+@assignments_group.command("deploy")
+@click.argument("round_id")
+@click.pass_context
+def assignments_deploy(ctx: click.Context, round_id: str) -> None:
+    """Deploy an assignment survey to Humanize."""
+    root = root_or_fail("tracker assignments deploy", ctx.obj["directory"])
+    _, _, _, Survey = edsl_types()
+    try:
+        from edsl import Coop
+    except ImportError as exc:
+        raise TrackerError("EDSL Humanize support is unavailable in this installation") from exc
+    directory = root / ".tracker" / "assignments" / round_id
+    prepared_path = directory / "prepared.json"
+    if not prepared_path.is_file():
+        raise TrackerError(f"No prepared assignment round named {round_id}")
+    private = root / ".tracker" / "private" / "assignments" / round_id
+    private.mkdir(parents=True, exist_ok=True)
+    deployed_path = private / "deployed.json"
+    if deployed_path.exists():
+        raise TrackerError(f"Assignment round {round_id} was already deployed")
+    prepared = json.loads(prepared_path.read_text())
+    reviewer = state(root)["people"][prepared["reviewer_id"]]
+    survey = Survey.git.load(str(root / prepared["survey_path"]))
+    try:
+        info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} task allocation {round_id}",
+            survey_description=f"Assign unassigned team tasks; reviewer: {reviewer.get('display_name', reviewer['id'])}.",
+            survey_visibility="private")
+    except Exception as exc:
+        raise TrackerError(f"Humanize deployment failed for assignment round {round_id}: {exc}") from exc
+    deployment = {key: info[key] for key in ("uuid", "respondent_url", "preview_url", "admin_url") if key in info}
+    deployed_path.write_text(json.dumps(deployment, indent=2) + "\n")
+    append_event(root, "assignments.deployed", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"]})
+    emit("tracker assignments deploy", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
+        "deployment": deployment, "warnings": ["The respondent URL is sensitive; send it only to the named reviewer."],
+        "next_steps": [f"After submission, run `tracker assignments collect {round_id}`."]})
+
+
+@assignments_group.command("collect")
+@click.argument("round_id")
+@click.pass_context
+def assignments_collect(ctx: click.Context, round_id: str) -> None:
+    """Fetch the assignment survey response into the private Results area."""
+    root = root_or_fail("tracker assignments collect", ctx.obj["directory"])
+    edsl_types()
+    try:
+        from edsl import Coop
+    except ImportError as exc:
+        raise TrackerError("EDSL Humanize support is unavailable in this installation") from exc
+    private = root / ".tracker" / "private" / "assignments" / round_id
+    deployed_path = private / "deployed.json"
+    if not deployed_path.is_file():
+        raise TrackerError(f"No deployed assignment survey found for {round_id}")
+    if (private / "collected.json").exists():
+        raise TrackerError(f"Responses for assignment round {round_id} were already collected")
+    deployment = json.loads(deployed_path.read_text())
+    try:
+        results = Coop().get_human_survey_responses(deployment["uuid"])
+    except Exception as exc:
+        raise TrackerError(f"Could not collect assignment survey responses: {exc}") from exc
+    saved = results.git.save(str(private / "assignments.results.ep"), message=f"Collect task assignment survey {round_id}")
+    (private / "collected.json").write_text(json.dumps({"result_path": saved["path"]}, indent=2) + "\n")
+    append_event(root, "assignments.collected", {"round_id": round_id})
+    emit("tracker assignments collect", {"round_id": round_id,
+        "next_steps": [f"Apply the reviewer's selections with `tracker assignments apply {round_id}`."]})
+
+
+@assignments_group.command("apply")
+@click.argument("round_id")
+@click.pass_context
+def assignments_apply(ctx: click.Context, round_id: str) -> None:
+    """Apply the reviewer's selected engineer for each still-unassigned task."""
+    root = root_or_fail("tracker assignments apply", ctx.obj["directory"])
+    _, _, Results, _ = edsl_types()
+    directory = root / ".tracker" / "assignments" / round_id
+    private = root / ".tracker" / "private" / "assignments" / round_id
+    prepared_path = directory / "prepared.json"
+    collected_path, applied_path = private / "collected.json", private / "applied.json"
+    if not prepared_path.is_file() or not collected_path.is_file():
+        raise TrackerError(f"Assignment round {round_id} must be prepared and collected before applying")
+    if applied_path.exists():
+        raise TrackerError(f"Assignment round {round_id} was already applied")
+    prepared = json.loads(prepared_path.read_text())
+    collected = json.loads(collected_path.read_text())
+    answers = response_answers(collected["result_path"], Results)
+    if len(answers) != 1:
+        raise TrackerError(f"Expected exactly one reviewer response; found {len(answers)}")
+    answer = answers[0]
+    current = state(root)
+    reviewer = current["people"].get(prepared["reviewer_id"])
+    if reviewer is None or not reviewer.get("active", True):
+        raise TrackerError(f"Reviewer {prepared['reviewer_id']} is no longer active")
+    existing_assignments = {event["data"].get("task_id"): event["data"].get("person_id")
+        for event in events(root) if event["kind"] == "task.assigned" and event["data"].get("assignment_round") == round_id}
+    applied: list[dict[str, str]] = [{"task_id": task_id, "person_id": person_id}
+        for task_id, person_id in existing_assignments.items() if person_id]
+    warnings: list[str] = []
+    for task_id, item in prepared["tasks"].items():
+        if task_id in existing_assignments:
+            continue
+        task = current["tasks"].get(task_id)
+        if task is None:
+            warnings.append(f"Task {task_id} no longer exists")
+            continue
+        if task.get("assignee_id"):
+            warnings.append(f"Task {task_id} has been assigned since the survey was prepared")
+            continue
+        choice = answer.get(item["question"])
+        person_id = item["choices"].get(choice)
+        if person_id is None:
+            continue
+        person = current["people"].get(person_id)
+        if person is None or not person.get("active", True):
+            warnings.append(f"Selected engineer {person_id} is no longer active")
+            continue
+        append_event(root, "task.assigned", {"task_id": task_id, "person_id": person_id,
+            "assigned_by": prepared["reviewer_id"], "source": "humanize_assignment_survey", "assignment_round": round_id})
+        applied.append({"task_id": task_id, "person_id": person_id})
+    final_state = state(root)
+    result = {"round_id": round_id, "reviewer_id": prepared["reviewer_id"], "assignments": applied,
+        "unassigned_count": sum(1 for task_id in prepared["tasks"]
+            if task_id in final_state["tasks"] and not final_state["tasks"][task_id].get("assignee_id")),
+        "warnings": warnings, "applied_at": datetime.now(UTC).isoformat()}
+    applied_path.write_text(json.dumps(result, indent=2) + "\n")
+    append_event(root, "assignments.applied", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
+        "assignments": applied, "unassigned_count": result["unassigned_count"]})
+    emit("tracker assignments apply", {**result, "next_steps": ["Review ownership with `tracker status` or build a memo."]})
+
+
 @updates_group.command("prepare")
 @click.option("--id", "round_id", required=True)
 @click.pass_context
@@ -580,10 +771,8 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
     for person in people:
         assigned = [task for task in current["tasks"].values()
                     if task.get("assignee_id") == person["id"] and task.get("status") not in {"done", "cancelled"}]
-        unassigned = [task for task in current["tasks"].values()
-                      if not task.get("assignee_id") and task.get("status") not in {"done", "cancelled"}]
         questions: list[Any] = []
-        mapping: dict[str, Any] = {"assigned": {}, "unassigned": {}}
+        mapping: dict[str, Any] = {"assigned": {}}
         for index, task in enumerate(assigned):
             status_name, note_name = f"assigned_status_{index:03d}", f"assigned_note_{index:03d}"
             feature = current["features"].get(task["feature_id"], {})
@@ -594,17 +783,6 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
             questions.append(QuestionFreeText(question_name=note_name,
                 question_text="Progress update, blocker, or context (optional)."))
             mapping["assigned"][task["id"]] = {"status": status_name, "note": note_name}
-        for index, task in enumerate(unassigned):
-            action_name, person_name = f"unassigned_action_{index:03d}", f"unassigned_person_{index:03d}"
-            feature = current["features"].get(task["feature_id"], {})
-            questions.append(QuestionMultipleChoice(question_name=action_name,
-                question_text=f"Unassigned task: {task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}). What should happen?",
-                question_options=["No action", "Claim for myself", "Propose another person"]))
-            possible_assignees = [item["id"] for item in people if item["id"] != person["id"]]
-            questions.append(QuestionMultipleChoice(question_name=person_name,
-                question_text="If you chose to propose another person, who should own this task? Otherwise choose no proposal.",
-                question_options=["No proposal", *possible_assignees]))
-            mapping["unassigned"][task["id"]] = {"action": action_name, "person": person_name}
         questions.append(QuestionFreeText(question_name="general_update",
             question_text="Anything else the team should know about your work? (optional)"))
         survey = Survey(questions)
@@ -703,7 +881,7 @@ def updates_collect(ctx: click.Context, round_id: str) -> None:
 @click.argument("round_id")
 @click.pass_context
 def updates_apply(ctx: click.Context, round_id: str) -> None:
-    """Append reported task statuses and pending ownership requests from responses."""
+    """Append reported task statuses and notes from responses."""
     root = root_or_fail("tracker updates apply", ctx.obj["directory"])
     _, _, Results, _ = edsl_types()
     private = root / ".tracker" / "private" / "updates" / round_id
@@ -716,7 +894,7 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
     prepared = json.loads(prepared_path.read_text())
     collected = json.loads(collected_path.read_text())["results"]
     current = state(root)
-    summary = {"status_updates": 0, "claim_requests": 0, "assignment_proposals": 0, "warnings": []}
+    summary = {"status_updates": 0, "warnings": []}
     existing_events = events(root)
     seen = {(event["kind"], event["data"].get("round_id"), event["data"].get("task_id"),
              event["data"].get("reported_by", event["data"].get("person_id"))) for event in existing_events}
@@ -759,27 +937,10 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
                     append_round_event("task.update_reported", task_id, person_id,
                         {"task_id": task_id, "note": note, "round_id": round_id, "reported_by": person_id})
                 summary["status_updates"] += 1
-        for task_id, names in mapping["unassigned"].items():
-            action = answer.get(names["action"])
-            if action == "Claim for myself":
-                append_round_event("task.claim_requested", task_id, person_id,
-                    {"task_id": task_id, "person_id": person_id, "round_id": round_id})
-                summary["claim_requests"] += 1
-            elif action == "Propose another person":
-                proposed = str(answer.get(names["person"], "")).strip()
-                if proposed == "No proposal":
-                    summary["warnings"].append(f"No proposed assignee was selected for task {task_id}")
-                    continue
-                if proposed not in current["people"]:
-                    summary["warnings"].append(f"Ignoring proposal for unknown person ID {proposed!r} on task {task_id}")
-                    continue
-                append_round_event("task.assignment_proposed", task_id, person_id, {"task_id": task_id, "person_id": person_id,
-                    "proposed_person_id": proposed, "round_id": round_id})
-                summary["assignment_proposals"] += 1
     applied = {"round_id": round_id, "applied_at": datetime.now(UTC).isoformat(), **summary}
     applied_path.write_text(json.dumps(applied, indent=2) + "\n")
-    append_event(root, "updates.applied", {"round_id": round_id, **{key: summary[key] for key in ("status_updates", "claim_requests", "assignment_proposals")}})
-    emit("tracker updates apply", {**applied, "next_steps": ["Review ownership requests with `tracker task requests`."]})
+    append_event(root, "updates.applied", {"round_id": round_id, "status_updates": summary["status_updates"]})
+    emit("tracker updates apply", {**applied, "next_steps": ["Review the task and feature status with `tracker memo build`."]})
 
 
 @memo_group.command("build")

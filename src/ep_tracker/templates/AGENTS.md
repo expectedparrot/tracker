@@ -14,6 +14,8 @@ repositories linked from projects here.
 
 - Use the `tracker` CLI for people, projects, repos, features, tasks, status,
   assignments, PR links, update rounds, and memos.
+- People default to role `engineer`; other roles are excluded from assignment
+  survey choices unless updated to engineer.
 - Do not edit `.tracker/events/`, `.tracker/tracker.json`, or
   `.tracker/updates/` by hand. State changes are append-only events.
 - Feature documentation belongs in `projects/<project>/features/<feature>/README.md`;
@@ -30,9 +32,13 @@ repositories linked from projects here.
   team has authorized the round, then share each respondent link only with its
   intended person.
 - Collect responses with `tracker updates collect`. Applying them changes task
-  status and records notes; ownership changes remain pending requests.
-- Review requests with `tracker task requests`, then accept or reject each
-  using `tracker task resolve-request <event-id> --decision accept|reject`.
+  status and records notes.
+- For unassigned work, choose a reviewer and prepare one allocation survey:
+  `tracker assignments prepare --id <round-id> --reviewer <person-id>`. It lists
+  every unassigned task and offers each active engineer as an assignment choice.
+- Deploy, collect, and apply an assignment round using the matching
+  `tracker assignments` commands. This records the reviewer's selected owner;
+  tasks marked “Leave unassigned” remain unassigned.
 
 ## Daily review
 

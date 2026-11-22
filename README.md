@@ -33,6 +33,9 @@ tracker task create --id saved-cards-build --feature saved-cards --title "Implem
 tracker memo build
 ```
 
+People default to the `engineer` role. Use `tracker person add --role <role>`
+for reviewers or other team members who should not appear as assignment choices.
+
 Every command emits one JSON envelope to stdout. The event history is stored
 under `.tracker/events/`, one event per file, which keeps concurrent Git changes
 from colliding on a shared JSONL file. Commit and share the tracker repository
@@ -40,10 +43,11 @@ with the same review workflow used for code.
 
 ## Humanize updates
 
-Install the optional EDSL integration with `uv pip install 'ep-tracker[fielding]'`.
-An update round creates a personalized survey for every active team member.
-Each survey asks for status and notes on that person's active tasks, then offers
-the current unassigned tasks for self-claim or an assignment proposal.
+Install the optional EDSL integration with `uv tool install --editable '.[fielding]'`.
+An update round creates a personalized survey for every active team member,
+asking for status and notes on that person's assigned tasks. Unassigned work has
+a separate allocation survey for one named reviewer; it lists every active
+unassigned task with the active engineers as choices.
 
 ```bash
 tracker updates prepare --id 2026-11-22
@@ -51,14 +55,17 @@ tracker updates deploy 2026-11-22
 # Send each returned respondent URL only to that person.
 tracker updates collect 2026-11-22
 tracker updates apply 2026-11-22
-tracker task requests
+tracker assignments prepare --id allocation-2026-11-22 --reviewer alex
+tracker assignments deploy allocation-2026-11-22
+tracker assignments collect allocation-2026-11-22
+tracker assignments apply allocation-2026-11-22
 ```
 
 Deployment is a separate command because it creates live Humanize surveys.
 Survey links and raw responses are stored under `.tracker/private/`, which the
-CLI adds to `.gitignore`. Applying responses appends reported task statuses and
-leaves ownership changes as pending requests for review. Resolve those with
-`tracker task resolve-request <event-id> --decision accept|reject`.
+CLI adds to `.gitignore`. Applying status responses appends reported task
+statuses and notes. Applying an assignment response assigns the selected
+engineer directly and leaves tasks marked “Leave unassigned” untouched.
 
 `tracker memo build` creates an immutable dated Markdown snapshot. If the team
 needs another snapshot for the same date, choose a new date; existing memo files

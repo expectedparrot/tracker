@@ -14,14 +14,16 @@ not edit tracker JSON files directly.
 3. Use `tracker guide` for the complete workflow and `tracker history` to
    inspect the append-only event record.
 4. Make state changes through `tracker` commands. Never edit or delete files in
-   `.tracker/events/`, `.tracker/tracker.json`, or `.tracker/updates/` by hand.
+   `.tracker/events/`, `.tracker/tracker.json`, `.tracker/updates/`, or
+   `.tracker/assignments/` by hand.
 5. Do not read, commit, or share `.tracker/private/`; it contains participant
    links and raw Humanize responses and is gitignored.
-6. Humanize deployment creates live surveys. Run `tracker updates deploy` only
-   when the user has asked to field that round. Send each respondent URL only
-   to its intended person.
-7. Treat self-claims and proposed assignments as pending until an authorized
-   person resolves the request with `tracker task resolve-request`.
+6. Humanize deployment creates live surveys. Run `tracker updates deploy` or
+   `tracker assignments deploy` only when the user has asked to field that
+   round. Send each respondent URL only to its intended person.
+7. For unassigned work, use `tracker assignments prepare --id <round>
+   --reviewer <person>` to create one allocation survey listing all unassigned
+   tasks and all active engineers. Only an authorized reviewer should apply it.
 
 ## Implementing changes in this Python repo
 
