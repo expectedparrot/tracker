@@ -21,6 +21,10 @@ repositories linked from projects here.
 - Feature documentation belongs in `projects/<project>/features/<feature>/README.md`;
   images belong in that feature's `images/` directory. Git history records
   edits to these working documents.
+- Tasks may be attached to a feature or stand alone; a standalone task may
+  optionally name a project. Use `tracker task create` for standalone build,
+  review, or approval work. Unassigned standalone tasks appear in the normal
+  reviewer assignment survey.
 - Never commit, print, or share `.tracker/private/`. It holds personalized
   Humanize links and raw respondent data.
 

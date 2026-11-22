@@ -55,6 +55,14 @@ def check_id(identifier: str, collection: dict[str, Any], label: str) -> None:
         raise TrackerError(f"Unknown {label} ID: {identifier}")
 
 
+def task_project_id(task: dict[str, Any], features: dict[str, Any]) -> str | None:
+    """Return a task's explicit or feature-inherited project, if any."""
+    if task.get("project_id"):
+        return task["project_id"]
+    feature = features.get(task.get("feature_id"), {})
+    return feature.get("project_id")
+
+
 @click.group(cls=TrackerGroup)
 @click.option("-C", "directory", type=click.Path(path_type=Path, file_okay=False), default=Path.cwd())
 @click.pass_context
@@ -426,22 +434,31 @@ def task_group() -> None:
 
 @task_group.command("create")
 @click.option("--id", "task_id", required=True)
-@click.option("--feature", "feature_id", required=True)
+@click.option("--feature", "feature_id", help="Optional feature this task belongs to.")
+@click.option("--project", "project_id", help="Optional project for a task without a feature.")
 @click.option("--title", required=True)
 @click.option("--kind", type=click.Choice(["build", "review", "approve", "other"]), default="build")
 @click.option("--assignee")
 @click.pass_context
-def task_create(ctx: click.Context, task_id: str, feature_id: str, title: str, kind: str, assignee: str | None) -> None:
+def task_create(ctx: click.Context, task_id: str, feature_id: str | None, project_id: str | None,
+                title: str, kind: str, assignee: str | None) -> None:
     root = root_or_fail("tracker task create", ctx.obj["directory"])
     validate_id(task_id, "Task ID")
     current = state(root)
-    check_id(feature_id, current["features"], "feature")
     if task_id in current["tasks"]:
         fail("tracker task create", "task_exists", f"Task {task_id} already exists.")
+    if feature_id:
+        check_id(feature_id, current["features"], "feature")
+        feature_project = current["features"][feature_id].get("project_id")
+        if project_id and project_id != feature_project:
+            raise TrackerError(f"Feature {feature_id} belongs to project {feature_project}, not {project_id}")
+        project_id = feature_project
+    elif project_id:
+        check_id(project_id, current["projects"], "project")
     if assignee:
         check_id(assignee, current["people"], "person")
-    data = {"task_id": task_id, "feature_id": feature_id, "title": title, "kind": kind,
-            "assignee_id": assignee, "status": "open"}
+    data = {"task_id": task_id, "feature_id": feature_id, "project_id": project_id,
+            "title": title, "kind": kind, "assignee_id": assignee, "status": "open"}
     append_event(root, "task.created", data)
     emit("tracker task create", {"task": data})
 
@@ -615,12 +632,12 @@ def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> 
         action_name = f"assignment_{index:04d}_action"
         engineer_name = f"assignment_{index:04d}_engineer"
         merge_name = f"assignment_{index:04d}_merge_target"
-        feature = current["features"].get(task["feature_id"], {})
-        source_project_id = feature.get("project_id")
+        feature = current["features"].get(task.get("feature_id"), {})
+        source_project_id = task_project_id(task, current["features"])
         active_tasks = [candidate for candidate in current["tasks"].values()
             if candidate.get("status") not in {"done", "cancelled", "merged"}
             and not candidate.get("completion_suspected")
-            and current["features"].get(candidate["feature_id"], {}).get("project_id") == source_project_id]
+            and task_project_id(candidate, current["features"]) == source_project_id]
         engineer_choices = {"No engineer selected": None}
         for person in engineers:
             label = f"{person['id']} — {person.get('display_name', person['id'])}"
@@ -629,13 +646,18 @@ def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> 
                          if candidate["id"] != task["id"] and not candidate.get("completion_suspected")]
         merge_choices = {"No merge target selected": None}
         for target in merge_targets:
-            target_feature = current["features"].get(target["feature_id"], {})
-            target_label = f"{target['id']} — {target['title']} (feature {target_feature.get('title', target['feature_id'])})"
+            target_feature = current["features"].get(target.get("feature_id"), {})
+            target_context = (f"feature {target_feature['title']}" if target_feature else
+                              f"project {task_project_id(target, current['features'])}" if task_project_id(target, current["features"])
+                              else "standalone")
+            target_label = f"{target['id']} — {target['title']} ({target_context})"
             merge_choices[target_label] = target["id"]
         actions = ["Assign to engineer", "Leave unassigned", "Probably already completed?"]
         if merge_targets:
             actions.append("Merge into another issue")
-        context = (f"{task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}; "
+        task_context = (f"feature {feature['title']}" if feature else
+                        f"project {source_project_id}" if source_project_id else "standalone task")
+        context = (f"{task['title']} (task {task['id']}; {task_context}; "
                    f"kind {task['kind']}; status {task.get('status', 'open')}).")
         questions.append(QuestionMultipleChoice(question_name=action_name,
             question_text=f"{context} What should happen to this unassigned issue?", question_options=actions))
@@ -806,8 +828,8 @@ def assignments_apply(ctx: click.Context, round_id: str) -> None:
             if target is None or target_id == task_id or target.get("status") in {"done", "cancelled", "merged"}:
                 warnings.append(f"No valid surviving issue was selected for task {task_id}")
                 continue
-            source_project_id = current["features"].get(task["feature_id"], {}).get("project_id")
-            target_project_id = current["features"].get(target["feature_id"], {}).get("project_id")
+            source_project_id = task_project_id(task, current["features"])
+            target_project_id = task_project_id(target, current["features"])
             if source_project_id != target_project_id:
                 warnings.append(f"Cannot merge task {task_id} into a task in another project")
                 continue
@@ -1056,12 +1078,15 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
         mapping: dict[str, Any] = {"assigned": {}}
         for index, task in enumerate(assigned):
             status_name, note_name = f"assigned_status_{index:03d}", f"assigned_note_{index:03d}"
-            feature = current["features"].get(task["feature_id"], {})
+            feature = current["features"].get(task.get("feature_id"), {})
+            project_id = task_project_id(task, current["features"])
+            task_context = (f"feature {feature['title']}" if feature else
+                            f"project {project_id}" if project_id else "standalone task")
             current_status = task.get("status", "open")
             status_options = [f"Keep current status ({current_status})"] + [
                 status for status in ("open", "in_progress", "blocked", "done") if status != current_status]
             questions.append(QuestionMultipleChoice(question_name=status_name,
-                question_text=f"{task['title']} (task {task['id']}; feature {feature.get('title', task['feature_id'])}; "
+                question_text=f"{task['title']} (task {task['id']}; {task_context}; "
                               f"current status {current_status}; {task['kind']}). Keep this status or change it?",
                 question_options=status_options))
             questions.append(QuestionFreeText(question_name=note_name,
@@ -1340,7 +1365,7 @@ def survey_guide() -> None:
          "commands": ["tracker updates prepare --id <round-id>", "tracker updates deploy <round-id>",
                       "tracker updates collect <round-id>", "tracker updates apply <round-id>"]},
         {"type": "task_assignment", "audience": "One named reviewer gets a survey containing all active unassigned tasks.",
-         "collects": "For each task, assign an engineer, leave it unassigned, flag it as probably complete for verification, or merge it into a selected surviving issue.",
+         "collects": "Includes feature-linked and standalone tasks. For each task, assign an engineer, leave it unassigned, flag it as probably complete for verification, or merge it into a selected surviving issue.",
          "commands": ["tracker assignments prepare --id <round-id> --reviewer <person-id>",
                       "tracker assignments deploy <round-id>", "tracker assignments collect <round-id>",
                       "tracker assignments apply <round-id>"]},
@@ -1392,7 +1417,11 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
             heading = people.get(person_id, {}).get("display_name", "Unassigned") if person_id != "unassigned" else "Unassigned"
             lines.extend([f"#### {heading}", ""])
             for task in tasks:
-                lines.append(f"- {task['title']} (`{task['id']}`, {task['kind']}) — feature `{task['feature_id']}`")
+                feature = current["features"].get(task.get("feature_id"), {})
+                project_id = task_project_id(task, current["features"])
+                task_context = (f"feature `{feature['id']}`" if feature else
+                                f"project `{project_id}`" if project_id else "standalone")
+                lines.append(f"- {task['title']} (`{task['id']}`, {task['kind']}) — {task_context}")
                 if task.get("completion_suspected"):
                     lines.append("  - Reviewer thinks this may already be complete; verify before closing or assigning it.")
                 if task.get("merged_into"):

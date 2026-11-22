@@ -35,6 +35,9 @@ not edit tracker JSON files directly.
    `collect`, and `apply` commands for public issue reporting. Review the
    survey before deployment; applying valid reports creates a feature and an
    unassigned task. Raw responses and the deployed link are private.
+9. Tasks may be created with a feature, or as standalone tasks with an
+   optional project. Unassigned standalone tasks are included in the regular
+   assignment survey.
 
 ## Implementing changes in this Python repo
 

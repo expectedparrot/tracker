@@ -14,8 +14,9 @@ JSON or event files by hand.
   link pull requests from multiple repositories in that project. Its folder
   contains a `README.md` for notes and an `images/` directory for supporting
   images.
-- **Tasks** are actionable work attached to a feature. A task can be assigned
-  to a person and can represent building, reviewing, or approving work.
+- **Tasks** are actionable work. They may belong to a feature or stand alone;
+  an optional project can group a standalone task. A task can be assigned to a
+  person and can represent building, reviewing, or approving work.
 - **Surveys** collect task updates, allocate unassigned work, or report new
   issues. Survey responses become tracker events only when explicitly applied.
 - **Daily memos** summarize features and tasks by status in a dated snapshot.
@@ -27,7 +28,8 @@ flowchart TD
     Team[Engineer or tracker CLI] -->|create work| New
     New --> Project[Project]
     Project --> Feature[Feature]
-    Feature --> Task[Task: build, review, or approve]
+    Feature -->|optional association| Task[Task: build, review, or approve]
+    Project -->|optional grouping| Task
     Project --> Repos[One or more code repositories]
     Feature --> PRs[Pull request links]
     Repos -. contains .-> PRs
@@ -69,7 +71,14 @@ tracker memo build
 People default to the `engineer` role. Use `tracker person add --role <role>`
 for reviewers or other team members who should not appear in engineer
 assignment choices. A feature can have multiple tasks and pull request links.
-Link each PR to a registered repository in the feature's project.
+Link each PR to a registered repository in the feature's project. Tasks can
+also be created without a feature, either independently or grouped under a
+project:
+
+```bash
+tracker task create --id rotate-keys --project billing --title "Rotate API keys" --kind other
+tracker task create --id review-runbook --title "Review incident runbook" --kind review
+```
 
 Every command emits one JSON envelope to stdout. Event files are stored one per
 file to avoid concurrent Git changes colliding on a shared JSONL file. Commit
@@ -80,7 +89,9 @@ and share the tracker repository with the same review workflow used for code.
 1. Run `tracker agent next` for state-aware guidance, or `tracker status` for a
    current overview. `tracker guide` describes the CLI workflow.
 2. Add people, projects, and repositories. Create features for larger goals,
-   then add build, review, or approval tasks and assign them when known.
+   then add build, review, or approval tasks and assign them when known. Create
+   standalone tasks directly with `tracker task create` when there is no
+   feature to attach them to.
 3. Link pull requests to the feature as work lands across the project's code
    repositories. Keep feature notes and images in its folder.
 4. Use surveys to gather updates from engineers and make decisions about
@@ -121,8 +132,8 @@ tracker updates apply 2026-11-22
 
 ### Allocate unassigned tasks
 
-One named reviewer gets a survey containing the active unassigned tasks and
-available engineers. For each task, the reviewer can assign it, leave it
+One named reviewer gets a survey containing all active unassigned tasks,
+including standalone tasks, and available engineers. For each task, the reviewer can assign it, leave it
 unassigned, flag it as probably complete, or merge it into another active task
 in the same project. A probable-completion flag is a request to verify; it does
 not mark the task done. A merge preserves the original task in history and
