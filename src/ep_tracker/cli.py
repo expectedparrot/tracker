@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -133,7 +134,7 @@ def guide() -> None:
         "tracker init → people/repos → tasks → daily memo",
         "updates prepare → deploy → collect → apply task status updates",
         "assignments prepare → deploy → collect → apply the reviewer's task assignments",
-        "priorities prepare → deploy → collect → apply the CTO's per-engineer task rankings",
+        "engineers estimate remaining effort; the CTO rates importance; reports sort by importance per hour",
         "triage prepare → deploy → collect → plan recommendations → agent verifies and runs gh issue actions",
     ], "storage": "Team state is derived from immutable event files under .tracker/events/.",
         "agent_guidance": ["Run `tracker agent next` before acting and after each material change.",
@@ -208,7 +209,7 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         else:
             stage, recommendation = "current", "Tracker state is current; review recent activity or start the next update round."
             steps = ["Inspect survey rounds with `tracker survey list` and recent events with `tracker history`.",
-                     "Start a status round with `tracker updates prepare --id <round-id>`, an assignment round with `tracker assignments prepare --id <round-id> --reviewer <person-id>`, or a priority round with `tracker priorities prepare --id <round-id> --reviewer <person-id>`. "]
+                     "Start a status and effort round with `tracker updates prepare --id <round-id>`, or an importance round with `tracker priorities prepare --id <round-id> --reviewer <person-id>`. "]
     emit(command, {"stage": stage, "tracker": read_config(root), "counts": counts,
         "recommendation": recommendation, "next_steps": steps})
 
@@ -429,7 +430,8 @@ def task_list(ctx: click.Context, assignee: str | None, status: str | None) -> N
         tasks = [item for item in tasks if item.get("assignee_id") == assignee]
     if status:
         tasks = [item for item in tasks if item.get("status") == status]
-    tasks.sort(key=lambda item: (item.get("assignee_id") or "~", *task_priority_sort_key(item)))
+    tasks = [{**task, "value_per_hour": task_value_per_hour(task)} for task in tasks]
+    tasks.sort(key=task_priority_sort_key)
     emit("tracker task list", {"tasks": tasks})
 
 
@@ -499,17 +501,40 @@ def edsl_types() -> tuple[Any, Any, Any, Any]:
     return QuestionFreeText, QuestionMultipleChoice, Results, Survey
 
 
-def edsl_rank_question_type() -> Any:
+def edsl_numerical_question_type() -> Any:
     try:
-        from edsl import QuestionRank
+        from edsl import QuestionNumerical
     except ImportError as exc:
         raise TrackerError("EDSL is required for survey workflows; install the fielding extra") from exc
-    return QuestionRank
+    return QuestionNumerical
+
+
+def task_value_per_hour(task: dict[str, Any]) -> float | None:
+    try:
+        effort = float(task["effort_hours"])
+        importance = float(task["importance"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (effort <= 0 or not math.isfinite(effort) or not math.isfinite(importance)
+            or not 1 <= importance <= 5):
+        return None
+    return importance / effort
 
 
 def task_priority_sort_key(task: dict[str, Any]) -> tuple[Any, ...]:
-    rank = task.get("priority_rank")
-    return (rank is None, rank if rank is not None else 0, task.get("id", task.get("task_id", "")))
+    score = task_value_per_hour(task)
+    try:
+        importance = float(task.get("importance", 0) or 0)
+    except (TypeError, ValueError):
+        importance = 0.0
+    if not 1 <= importance <= 5:
+        importance = 0.0
+    try:
+        effort = float(task.get("effort_hours", math.inf))
+    except (TypeError, ValueError):
+        effort = math.inf
+    return (score is None, -(score or 0), -importance, effort,
+            task.get("id", task.get("task_id", "")))
 
 
 def response_answers(result_path: str, Results: Any) -> list[dict[str, Any]]:
@@ -1226,6 +1251,7 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
     """Build and save personalized EDSL status surveys, without deploying them."""
     root = root_or_fail("tracker updates prepare", ctx.obj["directory"])
     QuestionFreeText, QuestionMultipleChoice, _, Survey = edsl_types()
+    QuestionNumerical = edsl_numerical_question_type()
     if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
         raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
     current = state(root)
@@ -1244,9 +1270,15 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
         questions: list[Any] = []
         mapping: dict[str, Any] = {"assigned": {}}
         for index, task in enumerate(assigned):
-            status_name, note_name = f"assigned_status_{index:03d}", f"assigned_note_{index:03d}"
+            status_name = f"assigned_status_{index:03d}"
+            note_name = f"assigned_note_{index:03d}"
+            comment_name = f"assigned_comment_{index:03d}"
+            effort_name = f"assigned_effort_hours_{index:03d}"
             task_context = ", ".join(task_repo_ids(task)) or "no linked repository"
             current_status = task.get("status", "open")
+            current_effort = task.get("effort_hours")
+            effort_context = (f"The current estimate is {current_effort:g} focused hours. "
+                if isinstance(current_effort, (int, float)) else "No effort estimate is recorded yet. ")
             status_options = [f"Keep current status ({current_status})"] + [
                 status for status in ("open", "in_progress", "blocked", "done") if status != current_status]
             questions.append(QuestionMultipleChoice(question_name=status_name,
@@ -1255,7 +1287,14 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
                 question_options=status_options))
             questions.append(QuestionFreeText(question_name=note_name,
                 question_text="Progress update, blocker, or context (optional)."))
+            questions.append(QuestionFreeText(question_name=comment_name,
+                question_text="Any comment or question for the team about this task? (optional)."))
+            questions.append(QuestionNumerical(question_name=effort_name,
+                question_text=(effort_context + "Estimate the focused work hours remaining to finish this task. "
+                    "Enter a positive number; decimals are okay. Leave blank if you cannot estimate it yet."),
+                min_value=0.25, max_value=10000, include_comment=False))
             mapping["assigned"][task["id"]] = {"status": status_name, "note": note_name,
+                "comment": comment_name, "effort_hours": effort_name,
                 "current_status": current_status}
         questions.append(QuestionFreeText(question_name="general_update",
             question_text="Anything else the team should know about your work? (optional)"))
@@ -1300,8 +1339,9 @@ def updates_deploy(ctx: click.Context, round_id: str) -> None:
             deployments[person_id] = json.loads(person_deployment.read_text())
             continue
         survey = Survey.git.load(str(root / item["survey_path"]))
-        optional_questions = {names["note"]: {"optional": True}
-            for names in item["questions"]["assigned"].values()}
+        optional_questions = {question_name: {"optional": True}
+            for names in item["questions"]["assigned"].values()
+            for question_name in (names["note"], names.get("comment"), names.get("effort_hours")) if question_name}
         optional_questions["general_update"] = {"optional": True}
         try:
             info = survey.humanize(human_survey_name=f"{team} tracker update {round_id} ({person_id})",
@@ -1355,7 +1395,7 @@ def updates_collect(ctx: click.Context, round_id: str) -> None:
 @click.argument("round_id")
 @click.pass_context
 def updates_apply(ctx: click.Context, round_id: str) -> None:
-    """Append reported task statuses and notes from responses."""
+    """Append reported task statuses, notes, and comments from responses."""
     root = root_or_fail("tracker updates apply", ctx.obj["directory"])
     _, _, Results, _ = edsl_types()
     private = root / ".tracker" / "private" / "updates" / round_id
@@ -1368,7 +1408,8 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
     prepared = json.loads(prepared_path.read_text())
     collected = json.loads(collected_path.read_text())["results"]
     current = state(root)
-    summary = {"status_updates": 0, "warnings": []}
+    summary: dict[str, Any] = {"status_updates": 0, "comments_recorded": 0,
+        "effort_estimates_recorded": 0, "warnings": []}
     existing_events = events(root)
     seen = {(event["kind"], event["data"].get("round_id"), event["data"].get("task_id"),
              event["data"].get("reported_by", event["data"].get("person_id"))) for event in existing_events}
@@ -1402,8 +1443,15 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
             if task_id not in current["tasks"]:
                 summary["warnings"].append(f"Task {task_id} no longer exists")
                 continue
+            if current["tasks"][task_id].get("assignee_id") != person_id:
+                summary["warnings"].append(f"Task {task_id} is no longer assigned to {person_id}; response was skipped")
+                continue
             status = answer.get(names["status"])
             note = str(answer.get(names["note"], "")).strip()
+            comment_name = names.get("comment")
+            comment = str(answer.get(comment_name, "") if comment_name else "").strip()
+            effort_name = names.get("effort_hours")
+            effort_answer = answer.get(effort_name) if effort_name else None
             keep_status = f"Keep current status ({names.get('current_status', current['tasks'][task_id].get('status', 'open'))})"
             current_status = current["tasks"][task_id].get("status", "open")
             if status in {"open", "in_progress", "blocked", "done"} and status != current_status:
@@ -1415,26 +1463,46 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
             if note and note.lower() not in {"none", "no update"}:
                 append_round_event("task.update_reported", task_id, person_id,
                     {"task_id": task_id, "note": note, "round_id": round_id, "reported_by": person_id})
+            if comment and comment.lower() not in {"none", "no update"}:
+                recorded = append_round_event("task.comment_reported", task_id, person_id,
+                    {"task_id": task_id, "comment": comment, "round_id": round_id, "reported_by": person_id})
+                if recorded:
+                    summary["comments_recorded"] += 1
+            if effort_answer is not None and str(effort_answer).strip():
+                try:
+                    effort_hours = float(effort_answer)
+                except (TypeError, ValueError):
+                    summary["warnings"].append(f"Ignoring invalid effort estimate for task {task_id}")
+                else:
+                    if not math.isfinite(effort_hours) or not 0.25 <= effort_hours <= 10000:
+                        summary["warnings"].append(f"Ignoring out-of-range effort estimate for task {task_id}")
+                    else:
+                        recorded = append_round_event("task.effort_estimated", task_id, person_id,
+                            {"task_id": task_id, "effort_hours": effort_hours,
+                             "estimated_by": person_id, "reported_by": person_id, "round_id": round_id})
+                        if recorded:
+                            summary["effort_estimates_recorded"] += 1
     applied = {"round_id": round_id, "applied_at": datetime.now(UTC).isoformat(), **summary}
     applied_path.write_text(json.dumps(applied, indent=2) + "\n")
-    append_event(root, "updates.applied", {"round_id": round_id, "status_updates": summary["status_updates"]})
+    append_event(root, "updates.applied", {"round_id": round_id, "status_updates": summary["status_updates"],
+        "comments_recorded": summary["comments_recorded"],
+        "effort_estimates_recorded": summary["effort_estimates_recorded"]})
     emit("tracker updates apply", {**applied, "next_steps": ["Review task status with `tracker memo build`."]})
 
 
 @main.group("priorities")
 def priorities_group() -> None:
-    """Rank engineers' tasks by team priority."""
+    """Rate task importance and sort work by importance per estimated hour."""
 
 
 @priorities_group.command("prepare")
 @click.option("--id", "round_id", required=True)
-@click.option("--reviewer", "reviewer_id", required=True, help="CTO or other person ranking priorities.")
+@click.option("--reviewer", "reviewer_id", required=True, help="CTO or other person rating task importance.")
 @click.pass_context
 def priorities_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> None:
-    """Build a private ranking survey with one task list per engineer."""
+    """Build a private survey for the CTO to rate active task importance."""
     root = root_or_fail("tracker priorities prepare", ctx.obj["directory"])
-    QuestionRank = edsl_rank_question_type()
-    _, _, _, Survey = edsl_types()
+    _, QuestionMultipleChoice, _, Survey = edsl_types()
     if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
         raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
     current = state(root)
@@ -1444,93 +1512,79 @@ def priorities_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> N
     round_dir = root / ".tracker" / "priorities" / round_id
     private_dir = root / ".tracker" / "private" / "priorities" / round_id
     if round_dir.exists() or private_dir.exists():
-        raise TrackerError(f"Priority-ranking round already exists: {round_id}")
-    assigned_by_person: dict[str, list[dict[str, Any]]] = {}
-    for task in current["tasks"].values():
-        person_id = task.get("assignee_id")
-        person = current["people"].get(person_id, {})
-        if (person_id and person.get("role", "engineer").lower() == "engineer"
-                and task.get("status") not in {"done", "cancelled", "merged"}):
-            assigned_by_person.setdefault(person_id, []).append(task)
-    if not assigned_by_person:
-        raise TrackerError("There are no active tasks assigned to engineers to rank")
+        raise TrackerError(f"Importance-rating round already exists: {round_id}")
+    tasks = [task for task in current["tasks"].values()
+        if task.get("status") not in {"done", "cancelled", "merged"}]
+    if not tasks:
+        raise TrackerError("There are no active tasks to rate")
     questions: list[Any] = []
-    engineers: dict[str, Any] = {}
-    for index, person_id in enumerate(sorted(assigned_by_person,
-            key=lambda pid: (current["people"][pid].get("display_name", pid).lower(), pid))):
-        person = current["people"][person_id]
-        tasks = sorted(assigned_by_person[person_id], key=task_priority_sort_key)
-        labels: list[str] = []
-        label_to_task: dict[str, str] = {}
-        for task in tasks:
-            context = ", ".join(task_repo_ids(task)) or "no linked repository"
-            label = (f"{task['id']} — {task['title']} [{task.get('status', 'open')}; "
-                     f"{task.get('kind', 'other')}; {context}]")
-            labels.append(label)
-            label_to_task[label] = task["id"]
-        question_name = f"engineer_{index:03d}_task_ranking"
-        questions.append(QuestionRank(question_name=question_name,
-            question_text=(f"Rank {person.get('display_name', person_id)}'s active tasks from highest to lowest team priority. "
-                           "Rank every task exactly once. The first task will appear first in priority-sorted reports."),
-            question_options=labels, num_selections=len(labels), include_comment=False))
-        engineers[person_id] = {"display_name": person.get("display_name", person_id),
-            "question_name": question_name, "label_to_task": label_to_task,
-            "task_ids": [task["id"] for task in tasks]}
+    task_questions: dict[str, str] = {}
+    importance_options = ["1 — Low", "2 — Modest", "3 — Meaningful", "4 — High", "5 — Critical"]
+    for index, task in enumerate(sorted(tasks, key=lambda item: item["id"])):
+        assignee = current["people"].get(task.get("assignee_id"), {}).get("display_name", "unassigned")
+        context = ", ".join(task_repo_ids(task)) or "no linked repository"
+        question_name = f"task_{index:04d}_importance"
+        questions.append(QuestionMultipleChoice(question_name=question_name,
+            question_text=(f"Task {task['id']}: {task['title']} [{task.get('status', 'open')}; "
+                f"{task.get('kind', 'other')}; owner: {assignee}; {context}]. "
+                "How important is this task to team outcomes right now, independent of its effort? "
+                "1 = low, 3 = meaningful, 5 = critical."), question_options=importance_options))
+        task_questions[task["id"]] = question_name
     survey = Survey(questions)
     round_dir.mkdir(parents=True)
-    survey_path = round_dir / "task_priorities.survey.ep"
-    saved = survey.git.save(str(survey_path), message=f"Prepare task priority ranking {round_id}")
+    survey_path = round_dir / "task_importance.survey.ep"
+    saved = survey.git.save(str(survey_path), message=f"Prepare task importance ratings {round_id}")
     Survey.git.load(saved["path"])
-    manifest = {"schema_version": "ep-tracker.priority-round/1.0", "round_id": round_id,
+    manifest = {"schema_version": "ep-tracker.importance-round/1.0", "round_id": round_id,
         "reviewer_id": reviewer_id, "created_at": datetime.now(UTC).isoformat(),
-        "survey_path": str(survey_path.relative_to(root)), "engineers": engineers,
-        "engineer_count": len(engineers), "task_count": sum(len(item["task_ids"]) for item in engineers.values())}
+        "survey_path": str(survey_path.relative_to(root)), "tasks": task_questions,
+        "task_count": len(task_questions), "importance_options": importance_options}
     (round_dir / "prepared.json").write_text(json.dumps(manifest, indent=2) + "\n")
     append_event(root, "priorities.prepared", {"round_id": round_id, "reviewer_id": reviewer_id,
-        "engineer_count": manifest["engineer_count"], "task_count": manifest["task_count"]})
+        "task_count": manifest["task_count"]})
     emit("tracker priorities prepare", {"round_id": round_id, "reviewer_id": reviewer_id,
-        "engineer_count": manifest["engineer_count"], "task_count": manifest["task_count"],
+        "task_count": manifest["task_count"],
         "survey_path": str(survey_path), "artifacts": [str(round_dir)],
-        "next_steps": [f"Review the ranking survey, then deploy with `tracker priorities deploy {round_id}`."]})
+        "next_steps": [f"Review the importance survey, then deploy with `tracker priorities deploy {round_id}`."]})
 
 
 @priorities_group.command("deploy")
 @click.argument("round_id")
 @click.pass_context
 def priorities_deploy(ctx: click.Context, round_id: str) -> None:
-    """Deploy the priority-ranking survey privately to its named reviewer."""
+    """Deploy the task importance survey privately to its named reviewer."""
     root = root_or_fail("tracker priorities deploy", ctx.obj["directory"])
     _, _, _, Survey = edsl_types()
     round_dir = root / ".tracker" / "priorities" / round_id
     prepared_path = round_dir / "prepared.json"
     if not prepared_path.is_file():
-        raise TrackerError(f"No prepared priority-ranking round named {round_id}")
+        raise TrackerError(f"No prepared importance-rating round named {round_id}")
     private_dir = root / ".tracker" / "private" / "priorities" / round_id
     private_dir.mkdir(parents=True, exist_ok=True)
     deployed_path = private_dir / "deployed.json"
     if deployed_path.exists():
-        raise TrackerError(f"Priority-ranking round {round_id} was already deployed")
+        raise TrackerError(f"Importance-rating round {round_id} was already deployed")
     prepared = json.loads(prepared_path.read_text())
     survey = Survey.git.load(str(root / prepared["survey_path"]))
     try:
-        info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} task priorities {round_id}",
-            survey_description=f"Private task-priority rankings for reviewer {prepared['reviewer_id']}.",
+        info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} task importance {round_id}",
+            survey_description=f"Private task-importance ratings for reviewer {prepared['reviewer_id']}.",
             survey_visibility="private")
     except Exception as exc:
-        raise TrackerError(f"Private Humanize deployment failed for priority-ranking round {round_id}: {exc}") from exc
+        raise TrackerError(f"Private Humanize deployment failed for importance-rating round {round_id}: {exc}") from exc
     deployment = {key: info[key] for key in ("uuid", "respondent_url", "preview_url", "admin_url") if key in info}
     deployed_path.write_text(json.dumps(deployment, indent=2) + "\n")
     append_event(root, "priorities.deployed", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"]})
     emit("tracker priorities deploy", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
         "deployment": deployment, "warnings": ["Send this private respondent URL only to the named reviewer."],
-        "next_steps": [f"After the reviewer ranks the tasks, collect with `tracker priorities collect {round_id}`."]})
+        "next_steps": [f"After the reviewer rates task importance, collect with `tracker priorities collect {round_id}`."]})
 
 
 @priorities_group.command("collect")
 @click.argument("round_id")
 @click.pass_context
 def priorities_collect(ctx: click.Context, round_id: str) -> None:
-    """Collect the reviewer's private priority-ranking response."""
+    """Collect the reviewer's private task-importance response."""
     root = root_or_fail("tracker priorities collect", ctx.obj["directory"])
     edsl_types()
     try:
@@ -1540,27 +1594,27 @@ def priorities_collect(ctx: click.Context, round_id: str) -> None:
     private_dir = root / ".tracker" / "private" / "priorities" / round_id
     deployed_path = private_dir / "deployed.json"
     if not deployed_path.is_file():
-        raise TrackerError(f"No deployed priority-ranking survey found for {round_id}")
+        raise TrackerError(f"No deployed importance-rating survey found for {round_id}")
     if (private_dir / "collected.json").exists():
-        raise TrackerError(f"Responses for priority-ranking round {round_id} were already collected")
+        raise TrackerError(f"Responses for importance-rating round {round_id} were already collected")
     deployment = json.loads(deployed_path.read_text())
     try:
         results = Coop().get_human_survey_responses(deployment["uuid"])
     except Exception as exc:
-        raise TrackerError(f"Could not collect priority-ranking responses: {exc}") from exc
-    saved = results.git.save(str(private_dir / "task_priorities.results.ep"),
-        message=f"Collect task priority ranking {round_id}")
+        raise TrackerError(f"Could not collect importance-rating responses: {exc}") from exc
+    saved = results.git.save(str(private_dir / "task_importance.results.ep"),
+        message=f"Collect task importance ratings {round_id}")
     (private_dir / "collected.json").write_text(json.dumps({"result_path": saved["path"]}, indent=2) + "\n")
     append_event(root, "priorities.collected", {"round_id": round_id})
     emit("tracker priorities collect", {"round_id": round_id,
-        "next_steps": [f"Apply the CTO's rankings with `tracker priorities apply {round_id}`."]})
+        "next_steps": [f"Apply the CTO's ratings with `tracker priorities apply {round_id}`."]})
 
 
 @priorities_group.command("apply")
 @click.argument("round_id")
 @click.pass_context
 def priorities_apply(ctx: click.Context, round_id: str) -> None:
-    """Append each ranked task's priority and use it in task reports."""
+    """Append importance ratings; task reports sort by importance per estimated hour."""
     root = root_or_fail("tracker priorities apply", ctx.obj["directory"])
     _, _, Results, _ = edsl_types()
     round_dir = root / ".tracker" / "priorities" / round_id
@@ -1568,9 +1622,9 @@ def priorities_apply(ctx: click.Context, round_id: str) -> None:
     prepared_path, collected_path = round_dir / "prepared.json", private_dir / "collected.json"
     applied_path = private_dir / "applied.json"
     if not prepared_path.is_file() or not collected_path.is_file():
-        raise TrackerError(f"Priority-ranking round {round_id} must be prepared and collected before applying")
+        raise TrackerError(f"Importance-rating round {round_id} must be prepared and collected before applying")
     if applied_path.exists():
-        raise TrackerError(f"Priority-ranking round {round_id} was already applied")
+        raise TrackerError(f"Importance-rating round {round_id} was already applied")
     prepared = json.loads(prepared_path.read_text())
     collected = json.loads(collected_path.read_text())
     answers = response_answers(collected["result_path"], Results)
@@ -1578,53 +1632,38 @@ def priorities_apply(ctx: click.Context, round_id: str) -> None:
         raise TrackerError(f"Expected exactly one completed response from reviewer {prepared['reviewer_id']}; found {len(answers)}")
     answer = answers[0]
     current = state(root)
-    existing = {(event["data"].get("ranking_round"), event["data"].get("task_id"))
-        for event in events(root) if event["kind"] == "task.priority_ranked"}
-    summary: dict[str, Any] = {"round_id": round_id, "ranked_task_count": 0, "warnings": []}
-    for person_id, item in prepared["engineers"].items():
-        raw_ranking = answer.get(item["question_name"])
-        labels = list(item["label_to_task"])
-        if isinstance(raw_ranking, dict):
-            ordered: list[Any] = [label for label, _ in sorted(raw_ranking.items(), key=lambda pair: pair[1])]
-        elif isinstance(raw_ranking, list):
-            ordered = list(raw_ranking)
-            if ordered and all(isinstance(value, int) for value in ordered):
-                if any(value < 0 or value >= len(labels) for value in ordered):
-                    summary["warnings"].append(f"Ranking for {person_id} contains an out-of-range option index")
-                    continue
-                ordered = [labels[value] for value in ordered]
-        else:
-            summary["warnings"].append(f"No valid ranking was returned for engineer {person_id}")
+    existing = {(event["data"].get("round_id"), event["data"].get("task_id"))
+        for event in events(root) if event["kind"] == "task.importance_rated"}
+    summary: dict[str, Any] = {"round_id": round_id, "importance_rating_count": 0, "warnings": []}
+    for task_id, question_name in prepared["tasks"].items():
+        task = current["tasks"].get(task_id)
+        if task is None:
+            summary["warnings"].append(f"Task {task_id} no longer exists")
             continue
-        if (not all(isinstance(value, str) for value in ordered) or len(ordered) != len(labels)
-                or len(set(ordered)) != len(labels) or set(ordered) != set(labels)):
-            summary["warnings"].append(f"Ranking for {person_id} did not include every task exactly once")
+        if task.get("status") in {"done", "cancelled", "merged"}:
+            summary["warnings"].append(f"Task {task_id} is no longer active; its rating was skipped")
             continue
-        label_to_task = item["label_to_task"]
-        for rank, label in enumerate(ordered, start=1):
-            task_id = label_to_task[label]
-            task = current["tasks"].get(task_id)
-            if task is None:
-                summary["warnings"].append(f"Task {task_id} no longer exists")
-                continue
-            if task.get("assignee_id") != person_id:
-                summary["warnings"].append(f"Task {task_id} was reassigned since the ranking survey was prepared")
-                continue
-            if task.get("status") in {"done", "cancelled", "merged"}:
-                summary["warnings"].append(f"Task {task_id} is no longer active; its ranking was skipped")
-                continue
-            if (round_id, task_id) in existing:
-                continue
-            append_event(root, "task.priority_ranked", {"task_id": task_id, "person_id": person_id,
-                "rank": rank, "ranked_by": prepared["reviewer_id"], "ranking_round": round_id})
-            existing.add((round_id, task_id))
-            summary["ranked_task_count"] += 1
+        raw_rating = answer.get(question_name)
+        try:
+            importance = int(str(raw_rating).split("—", 1)[0].strip())
+        except (TypeError, ValueError):
+            summary["warnings"].append(f"No valid importance rating was returned for task {task_id}")
+            continue
+        if importance not in {1, 2, 3, 4, 5}:
+            summary["warnings"].append(f"Importance rating for task {task_id} must be from 1 to 5")
+            continue
+        if (round_id, task_id) in existing:
+            continue
+        append_event(root, "task.importance_rated", {"task_id": task_id, "importance": importance,
+            "rated_by": prepared["reviewer_id"], "round_id": round_id})
+        existing.add((round_id, task_id))
+        summary["importance_rating_count"] += 1
     summary["applied_at"] = datetime.now(UTC).isoformat()
     applied_path.write_text(json.dumps(summary, indent=2) + "\n")
     append_event(root, "priorities.applied", {"round_id": round_id,
-        "reviewer_id": prepared["reviewer_id"], "ranked_task_count": summary["ranked_task_count"]})
+        "reviewer_id": prepared["reviewer_id"], "importance_rating_count": summary["importance_rating_count"]})
     emit("tracker priorities apply", {**summary,
-        "next_steps": ["Review task ordering with `tracker task list` or `tracker memo build`."]})
+        "next_steps": ["Review value-per-effort ordering with `tracker task list` or `tracker memo build`."]})
 
 
 @main.group("survey")
@@ -1634,7 +1673,7 @@ def survey_group() -> None:
 
 @survey_group.command("list")
 @click.option("--type", "survey_type", type=click.Choice([
-    "task_status_update", "task_assignment", "issue_report", "issue_triage", "task_priority_ranking"]))
+    "task_status_update", "task_assignment", "issue_report", "issue_triage", "task_importance_rating"]))
 @click.pass_context
 def survey_list(ctx: click.Context, survey_type: str | None) -> None:
     """List survey rounds and their local lifecycle status, without showing private links."""
@@ -1644,7 +1683,7 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         "assignments": ("task_assignment", "assignments"),
         "intake": ("issue_report", "intake"),
         "triage": ("issue_triage", "triage"),
-        "priorities": ("task_priority_ranking", "priorities"),
+        "priorities": ("task_importance_rating", "priorities"),
     }
     rounds: dict[tuple[str, str], dict[str, Any]] = {}
     warnings: list[str] = []
@@ -1713,7 +1752,6 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
                     summary["repo_count"] = len(prepared.get("repo_choices", {}))
                 elif family == "priorities":
                     summary["reviewer_id"] = prepared.get("reviewer_id")
-                    summary["engineer_count"] = prepared.get("engineer_count", 0)
                     summary["task_count"] = prepared.get("task_count", 0)
                 else:
                     summary["reviewer_id"] = prepared.get("reviewer_id")
@@ -1747,7 +1785,7 @@ def survey_guide() -> None:
     """Explain survey types, their audiences, and their command workflows."""
     emit("tracker survey guide", {"survey_types": [
         {"type": "task_status_update", "audience": "Each active team member gets a personalized survey.",
-         "collects": "Shows the tracked status for each active assigned task and asks whether to keep it or change it, with optional progress or blocker notes and an optional general update.",
+         "collects": "Shows the tracked status for each active assigned task and asks whether to keep it or change it, estimate focused hours remaining, add progress notes, and add separate comments or questions for the team, plus an optional general update.",
          "commands": ["tracker updates prepare --id <round-id>", "tracker updates deploy <round-id>",
                       "tracker updates collect <round-id>", "tracker updates apply <round-id>"]},
         {"type": "task_assignment", "audience": "One named reviewer gets a survey containing all active unassigned tasks.",
@@ -1764,8 +1802,8 @@ def survey_guide() -> None:
          "commands": ["tracker triage prepare --id <round-id> --reviewer <person-id> [--repo <repo-id>]",
                       "tracker triage deploy <round-id>", "tracker triage collect <round-id>",
                       "tracker triage plan <round-id>"]},
-        {"type": "task_priority_ranking", "audience": "One named CTO or reviewer ranks active tasks grouped by engineer.",
-         "collects": "A complete high-to-low ranking for each engineer. The latest ranking is stored as append-only task events and sorts tasks in task lists and daily memos; unranked tasks follow ranked tasks.",
+        {"type": "task_importance_rating", "audience": "One named CTO or reviewer rates all active tasks.",
+         "collects": "Importance from 1 (low) to 5 (critical). Engineers estimate remaining work hours in their task updates. Task lists and daily memos sort by importance divided by estimated hours; tasks missing either input follow scored tasks.",
          "commands": ["tracker priorities prepare --id <round-id> --reviewer <person-id>",
                       "tracker priorities deploy <round-id>", "tracker priorities collect <round-id>",
                       "tracker priorities apply <round-id>"]},
@@ -1792,7 +1830,7 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
     current = state(root)
     people = current["people"]
     lines = [f"# Team tracker memo — {memo_date}", ""]
-    lines.extend(["## Priority order by engineer", ""])
+    lines.extend(["## Value per effort by engineer", ""])
     active_by_person: dict[str, list[dict[str, Any]]] = {}
     for task in current["tasks"].values():
         person_id = task.get("assignee_id")
@@ -1805,9 +1843,9 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
         heading = people.get(person_id, {}).get("display_name", person_id)
         lines.extend([f"### {heading}", ""])
         for task in sorted(tasks, key=task_priority_sort_key):
-            rank = task.get("priority_rank")
-            priority = f"Priority {rank}" if rank is not None else "Unranked"
-            lines.append(f"- {priority} — {task['title']} (`{task['id']}`, {task.get('status', 'open')})")
+            score = task_value_per_hour(task)
+            score_text = f"{score:.3f} importance/hour" if score is not None else "Not scored"
+            lines.append(f"- {score_text} — {task['title']} (`{task['id']}`, {task.get('status', 'open')})")
         lines.append("")
     lines.extend(["## Tasks by status and assignee", ""])
     grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -1824,13 +1862,19 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
             for task in tasks:
                 repo_ids = task_repo_ids(task)
                 task_context = ", ".join(f"repo `{repo_id}`" for repo_id in repo_ids) or "no linked repository"
-                lines.append(f"- {task['title']} (`{task['id']}`, {task.get('kind', 'other')}) — {task_context}")
+                score = task_value_per_hour(task)
+                score_text = f"{score:.3f} importance points/hour" if score is not None else "value/effort not scored"
+                lines.append(f"- {task['title']} (`{task['id']}`, {task.get('kind', 'other')}) — {task_context}; {score_text}")
                 if task.get("completion_suspected"):
                     lines.append("  - Reviewer thinks this may already be complete; verify before closing or assigning it.")
                 if task.get("merged_into"):
                     lines.append(f"  - Merged into task `{task['merged_into']}`.")
                 if task.get("latest_update"):
                     lines.append(f"  - Update from {task.get('reported_by', 'team member')}: {task['latest_update']}")
+                for comment in task.get("comments", []):
+                    comment_text = " ".join(str(comment.get("comment", "")).splitlines())
+                    if comment_text:
+                        lines.append(f"  - Comment/question from {comment.get('reported_by', 'team member')}: {comment_text}")
         lines.append("")
     lines.extend(["## Linked pull requests", ""])
     for pr in current["pull_requests"]:

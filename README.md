@@ -5,6 +5,38 @@ The core object is a **task**: a piece of work with an owner, status, notes, and
 optional links to one or more code repositories and pull requests. People and
 agents use the CLI; they do not edit tracker JSON or event files by hand.
 
+## Quick start: how to use it
+
+1. Install the CLI and initialize a Git repository for the team tracker.
+2. Add team members and the code repositories they work in.
+3. Create tasks, assign owners, and link related repositories and pull requests.
+   Put task notes and images in `tasks/<task-id>/`.
+4. Use surveys to gather engineer updates and effort estimates, assign unowned
+   tasks, and let the CTO rate task importance.
+   Each survey follows **prepare → review → deploy → collect → apply**.
+5. Build the daily team report with `tracker memo build`. Run
+   `tracker agent next` for the recommended next action.
+
+```bash
+uv tool install --editable '.[fielding]'
+tracker init ./team-tracker --name "Platform"
+cd ./team-tracker
+tracker person add --id alex --name "Alex Kim"
+tracker person add --id cto --name "Casey Lee" --role reviewer
+tracker repo add --id billing-api --url https://github.com/acme/billing-api
+tracker task create --id saved-cards --title "Build saved cards" \
+  --assignee alex --repo billing-api
+tracker task pr saved-cards --repo billing-api \
+  --url https://github.com/acme/billing-api/pull/42 --number 42
+tracker memo build
+```
+
+For example, collect task updates with `tracker updates prepare --id daily`,
+then review the survey and run the matching `deploy`, `collect`, and `apply`
+commands. Rate task importance with `tracker priorities prepare --id
+priorities --reviewer cto` and its matching lifecycle commands. Task reports
+sort by importance per estimated hour; the sections below explain each workflow.
+
 ## Model
 
 - **People** are engineers, reviewers, or other team members.
@@ -13,25 +45,25 @@ agents use the CLI; they do not edit tracker JSON or event files by hand.
 - **Tasks** can represent implementation, review, approval, follow-up, or
   another action. Each task has a `README.md` and `images/` folder for notes
   and supporting material.
-- **Surveys** collect status updates, allocate unassigned tasks, report new
-  tasks, rank task priorities, or triage GitHub issues.
+- **Surveys** collect status and effort updates, allocate unassigned tasks,
+  report new tasks, rate importance, or triage GitHub issues.
 - **Events** are append-only. The CLI derives current state from
   `.tracker/events/`; survey answers change state only when explicitly applied.
-- **Daily memos** summarize task status and show priority order for each
-  engineer in immutable dated snapshots.
+- **Daily memos** summarize task status and show value-per-effort order for
+  each engineer in immutable dated snapshots.
 
 ```mermaid
 flowchart TD
     Person[Engineer or reviewer] --> Task[Task]
     Repo[Repository] <-->|linked directly| Task
     Task --> PR[Pull request]
-    Engineer[Engineer] -->|status update| Update[Status survey]
-    CTO[CTO or reviewer] -->|rank tasks per engineer| Ranking[Priority survey]
+    Engineer[Engineer] -->|status and hours remaining| Update[Status survey]
+    CTO[CTO or reviewer] -->|rate task importance 1 to 5| Rating[Importance survey]
     Reviewer[Reviewer] -->|assign unowned work| Assignment[Assignment survey]
     Reporter[Anyone with public report URL] --> Intake[Issue report survey]
     Task --> Events[Append-only event history]
     Update -->|apply| Events
-    Ranking -->|apply| Events
+    Rating -->|apply| Events
     Assignment -->|apply| Events
     Intake -->|apply| Events
     Events --> Memo[Daily memo]
@@ -107,8 +139,11 @@ Deployment is a live external action.
 ### Engineer task updates
 
 Each active team member gets a personalized survey showing the tracked status
-of their active tasks. They can keep or change each status and add task notes or
-a general update. Completed and cancelled tasks are omitted.
+of their active tasks. They can keep or change each status, estimate remaining
+focused work hours, add task notes, and add a separate comment or question for
+the team. General updates are also supported. Comments are preserved as task
+events and appear in task listings and daily memos. Completed and cancelled
+tasks are omitted.
 
 ```bash
 tracker updates prepare --id 2026-11-22
@@ -148,21 +183,36 @@ tracker intake apply public-issues
 Tell respondents that reports become visible to the team when applied. The
 respondent URL is public and reusable; share it intentionally.
 
-### Rank task priorities
+### Estimate effort and rate importance
 
-A CTO or named reviewer ranks active tasks separately for each engineer, from
-highest to lowest. Rank 1 is the top priority. Applying a round records the
-rank on each task. Task lists and memos use the latest ranking, with unranked
-tasks after ranked tasks. Reassignment clears the old rank.
+In their task update survey, each engineer estimates the focused work hours
+remaining to complete every active assigned task. The estimate can be left
+blank if they cannot estimate yet. Separately, the CTO or a named reviewer
+rates every active task's importance from 1 (low) to 5 (critical), independent
+of effort.
+
+Task lists and memos sort by **importance / estimated hours**. This is a rough
+value-per-effort signal, not a cross-engineer capacity model. Tasks missing
+either input appear after scored tasks. Reassignment clears the old effort
+estimate so the new owner can provide one; importance stays with the task.
 
 ```bash
-tracker priorities prepare --id q4-priorities --reviewer cto
-tracker priorities deploy q4-priorities
-tracker priorities collect q4-priorities
-tracker priorities apply q4-priorities
+tracker updates prepare --id estimates-2026-11-22
+tracker updates deploy estimates-2026-11-22
+tracker updates collect estimates-2026-11-22
+tracker updates apply estimates-2026-11-22
+
+tracker priorities prepare --id importance-2026-11-22 --reviewer cto
+tracker priorities deploy importance-2026-11-22
+tracker priorities collect importance-2026-11-22
+tracker priorities apply importance-2026-11-22
 tracker task list --assignee alex
 tracker memo build
 ```
+
+The engineer survey covers that person's active assigned tasks. The CTO survey
+covers all active tasks, including unassigned ones. Done, cancelled, and
+merged tasks are omitted.
 
 ### Triage GitHub issues
 
@@ -191,7 +241,7 @@ status without exposing private links:
 
 ```bash
 tracker survey list
-tracker survey list --type task_priority_ranking
+tracker survey list --type task_importance_rating
 tracker survey list --type task_assignment
 ```
 
@@ -204,9 +254,9 @@ share them only with the intended respondents. Issue-report URLs are public.
 tracker memo build
 ```
 
-The memo groups tasks by status and assignee, includes each engineer's priority
-order, and preserves each date as an immutable Markdown snapshot. Choose a
-different date to create another snapshot.
+The memo groups tasks by status and assignee, includes each engineer's
+importance-per-effort order, and preserves each date as an immutable Markdown
+snapshot. Choose a different date to create another snapshot.
 
 ## Agent guidance
 

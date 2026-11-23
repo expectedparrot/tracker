@@ -15,11 +15,11 @@
    unassigned tasks. The reviewer may assign, defer, flag probable completion
    for verification, or merge duplicate tasks. Probable completion is not
    closure.
-6. Use `tracker updates prepare` to ask engineers about the status of their
-   assigned tasks. Use `tracker priorities prepare --id <round> --reviewer
-   <person>` for a CTO to rank active tasks separately for each engineer.
-   Applied rankings sort task lists and daily memos; reassignment clears an
-   earlier rank.
+6. Use `tracker updates prepare` to ask engineers about assigned task status
+   and remaining work hours. Use `tracker priorities prepare --id <round>
+   --reviewer <person>` for the CTO to rate active task importance from 1 to 5.
+   Reports sort by importance per estimated hour; reassignment clears an old
+   effort estimate.
 7. Use `tracker intake prepare` for public task reports. Tell respondents
    reports become team-visible when applied. Review the form before deployment.
 8. For GitHub issue triage, use `tracker triage plan <round>`, then re-read

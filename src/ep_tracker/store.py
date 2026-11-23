@@ -84,17 +84,20 @@ def state(root: Path) -> dict[str, Any]:
                     task["latest_update"] = data["update"]
             else:
                 task["assignee_id"] = data.get("person_id")
-                if task.get("priority_rank_assignee_id") != data.get("person_id"):
-                    task.pop("priority_rank", None)
-                    task.pop("priority_rank_assignee_id", None)
-                    task.pop("priority_ranked_by", None)
-                    task.pop("priority_round", None)
-        elif kind == "task.priority_ranked":
+                if task.get("effort_estimated_by") != data.get("person_id"):
+                    task.pop("effort_hours", None)
+                    task.pop("effort_estimated_by", None)
+                    task.pop("effort_round", None)
+        elif kind == "task.effort_estimated":
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
-            task["priority_rank"] = data["rank"]
-            task["priority_rank_assignee_id"] = data["person_id"]
-            task["priority_ranked_by"] = data.get("ranked_by")
-            task["priority_round"] = data.get("ranking_round")
+            task["effort_hours"] = data["effort_hours"]
+            task["effort_estimated_by"] = data.get("estimated_by")
+            task["effort_round"] = data.get("round_id")
+        elif kind == "task.importance_rated":
+            task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
+            task["importance"] = data["importance"]
+            task["importance_rated_by"] = data.get("rated_by")
+            task["importance_round"] = data.get("round_id")
         elif kind == "task.completion_suspected":
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
             task["completion_suspected"] = True
@@ -112,6 +115,11 @@ def state(root: Path) -> dict[str, Any]:
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
             task["latest_update"] = data.get("note")
             task["reported_by"] = data.get("reported_by")
+        elif kind == "task.comment_reported":
+            task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
+            task.setdefault("comments", []).append({"comment": data["comment"],
+                "reported_by": data.get("reported_by"), "round_id": data.get("round_id"),
+                "recorded_at": event["recorded_at"]})
         elif kind == "person.update_reported":
             result["team_updates"].append(data)
         elif kind == "pull_request.linked":

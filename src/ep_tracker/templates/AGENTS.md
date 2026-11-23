@@ -18,11 +18,13 @@ and raw responses.
 - For unassigned work, use the reviewer assignment survey. Probable completion
   requires verification; it does not close a task. Merges preserve the original
   task in history.
-- Engineers can report status for all their active tasks through personalized
-  update surveys.
-- A CTO or named reviewer can rank active tasks separately for each engineer
-  with the priorities survey. Applied ranks sort task lists and daily memos;
-  reassignment clears a task's prior rank.
+- Engineers can report status and estimate remaining work hours for their
+  active tasks through personalized update surveys. Each task also has
+  separate optional fields for progress notes and comments or questions for
+  the team; applied comments stay on the task.
+- A CTO or named reviewer can rate active task importance from 1 to 5 with the
+  priorities survey. Task lists and memos sort by importance per estimated
+  hour; reassignment clears the old effort estimate.
 - Public issue intake creates one unassigned task per valid report. Tell
   respondents the report becomes team-visible when applied.
 - GitHub issue triage only prepares recommendations. Re-read each live issue
@@ -32,5 +34,5 @@ and raw responses.
   then create or update a review task and link its pull request.
 
 Build the day's snapshot with `tracker memo build`. It groups tasks by status
-and assignee, shows per-engineer priority order, and preserves each date as an
-immutable Markdown memo.
+and assignee, shows per-engineer value-per-effort order, and preserves each
+date as an immutable Markdown memo.
