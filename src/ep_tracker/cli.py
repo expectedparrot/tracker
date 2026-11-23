@@ -8,6 +8,7 @@ import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 
@@ -61,6 +62,21 @@ def task_project_id(task: dict[str, Any], features: dict[str, Any]) -> str | Non
         return task["project_id"]
     feature = features.get(task.get("feature_id"), {})
     return feature.get("project_id")
+
+
+def github_repo_slug(repo_url: str) -> str:
+    """Convert a repository URL into the OWNER/REPO form accepted by gh."""
+    if "://" not in repo_url and ":" in repo_url:
+        host, path = repo_url.rsplit(":", 1)
+        host = host.rsplit("@", 1)[-1]
+    else:
+        parsed = urlsplit(repo_url)
+        host = parsed.hostname or ""
+        path = parsed.path
+    parts = [part for part in path.strip("/").removesuffix(".git").split("/") if part]
+    if not host or len(parts) != 2:
+        raise TrackerError(f"Repository URL must identify a GitHub owner and repository: {repo_url}")
+    return "/".join(parts) if host.lower() == "github.com" else f"{host}/{parts[0]}/{parts[1]}"
 
 
 @click.group(cls=TrackerGroup)
@@ -120,6 +136,7 @@ def guide() -> None:
         "tracker init → people/projects/repos → features/tasks → daily memo",
         "updates prepare → deploy → collect → apply task status updates",
         "assignments prepare → deploy → collect → apply the reviewer's task assignments",
+        "triage prepare → deploy → collect → plan recommendations → agent verifies and runs gh issue actions",
     ], "storage": "Team state is derived from immutable event files under .tracker/events/.",
         "agent_guidance": ["Run `tracker agent next` before acting and after each material change.",
             "Use CLI commands for state changes; do not edit tracker JSON or event files directly.",
@@ -149,7 +166,13 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
                 "Run `tracker init <directory> --name <team>`."]})
         return
     current = state(root)
+    history = events(root)
     counts = {name: len(current[name]) for name in ("people", "projects", "repos", "features", "tasks")}
+    planned_triage_rounds = {event["data"].get("round_id") for event in history
+        if event["kind"] == "issue_triage.planned"}
+    pending_triage_rounds = sorted({event["data"].get("round_id") for event in history
+        if event["kind"] == "issue_triage.collected" and event["data"].get("round_id")}
+        - planned_triage_rounds)
     if not current["people"]:
         stage, recommendation = "setup-people", "Register the team's engineers and other task owners."
         steps = ["Collect each person's stable ID, display name, and optional GitHub handle.",
@@ -162,14 +185,18 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         stage, recommendation = "link-repositories", "Link the code repositories this team tracks."
         steps = ["Inspect projects with `tracker project list`.",
                  "Link repositories with `tracker project repo --id <repo-id> --project <project-id> --url <url>`."]
-    elif not current["features"]:
-        stage, recommendation = "setup-features", "Create the team's first feature and its tasks."
-        steps = ["Create a feature with `tracker feature create --id <id> --project <project-id> --title <title>`.",
-                 "Add build, review, or approval work with `tracker task create`."]
     elif current["assignment_requests"]:
         stage, recommendation = "review-assignments", "Review pending task claims and assignment proposals."
         steps = ["Inspect requests with `tracker task requests`.",
                  "Resolve each request with `tracker task resolve-request <event-id> --decision accept|reject`."]
+    elif pending_triage_rounds:
+        stage, recommendation = "process-issue-triage", "Review the collected GitHub issue triage recommendations."
+        steps = [f"Build the agent handoff with `tracker triage plan {pending_triage_rounds[-1]}`.",
+                 "Verify each issue's live state and selected target, then execute appropriate GitHub actions."]
+    elif not current["features"]:
+        stage, recommendation = "setup-features", "Create the team's first feature and its tasks."
+        steps = ["Create a feature with `tracker feature create --id <id> --project <project-id> --title <title>`.",
+                 "Add build, review, or approval work with `tracker task create`."]
     elif any(task.get("completion_suspected") for task in current["tasks"].values()):
         stage, recommendation = "verify-completion", "Check tasks the assignment reviewer thinks may already be complete."
         suspected_ids = [task["id"] for task in current["tasks"].values() if task.get("completion_suspected")]
@@ -572,7 +599,7 @@ def edsl_types() -> tuple[Any, Any, Any, Any]:
     try:
         from edsl import QuestionFreeText, QuestionMultipleChoice, Results, Survey
     except ImportError as exc:
-        raise TrackerError("EDSL is required for update surveys; install the fielding extra") from exc
+        raise TrackerError("EDSL is required for survey workflows; install the fielding extra") from exc
     return QuestionFreeText, QuestionMultipleChoice, Results, Survey
 
 
@@ -861,6 +888,257 @@ def assignments_apply(ctx: click.Context, round_id: str) -> None:
     append_event(root, "assignments.applied", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
         "assignments": assignments, "outcomes": outcomes, "unassigned_count": result["unassigned_count"]})
     emit("tracker assignments apply", {**result, "next_steps": ["Review ownership with `tracker status` or build a memo."]})
+
+
+@main.group("triage")
+def triage_group() -> None:
+    """Survey GitHub issue triage and prepare recommendations for an agent."""
+
+
+@triage_group.command("prepare")
+@click.option("--id", "round_id", required=True)
+@click.option("--reviewer", "reviewer_id", required=True)
+@click.option("--project", "project_id", help="Limit the scan to one tracker project.")
+@click.option("--limit-per-repo", type=click.IntRange(min=1, max=1000), default=50, show_default=True)
+@click.pass_context
+def triage_prepare(ctx: click.Context, round_id: str, reviewer_id: str, project_id: str | None,
+                   limit_per_repo: int) -> None:
+    """Fetch open GitHub issues and prepare a private triage survey."""
+    root = root_or_fail("tracker triage prepare", ctx.obj["directory"])
+    QuestionFreeText, QuestionMultipleChoice, _, Survey = edsl_types()
+    if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
+        raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
+    current = state(root)
+    check_id(reviewer_id, current["people"], "reviewer")
+    if not current["people"][reviewer_id].get("active", True):
+        raise TrackerError(f"Reviewer {reviewer_id} is inactive")
+    if project_id:
+        check_id(project_id, current["projects"], "project")
+    round_dir = root / ".tracker" / "triage" / round_id
+    private_dir = root / ".tracker" / "private" / "triage" / round_id
+    if round_dir.exists() or private_dir.exists():
+        raise TrackerError(f"Issue-triage round already exists: {round_id}")
+    repos = [repo for repo in current["repos"].values()
+             if not project_id or repo.get("project_id") == project_id]
+    if not repos:
+        raise TrackerError("No registered repositories found for the selected project scope")
+    try:
+        engineers = [person for person in current["people"].values()
+                     if person.get("active", True) and person.get("role", "engineer").lower() == "engineer"
+                     and person.get("github")]
+        engineer_choices = {"No assignee selected": None}
+        for person in engineers:
+            label = f"{person['id']} — {person.get('display_name', person['id'])} (@{person['github']})"
+            engineer_choices[label] = person["github"]
+        issues: list[dict[str, Any]] = []
+        scanned_repos: list[str] = []
+        for repo in repos:
+            gh_repo = github_repo_slug(repo["url"])
+            result = subprocess.run(["gh", "issue", "list", "--repo", gh_repo, "--state", "open",
+                "--limit", str(limit_per_repo), "--json", "number,title,url,body,author,assignees,labels"],
+                check=False, capture_output=True, text=True)
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip() or "unknown gh error"
+                raise TrackerError(f"Could not list issues for repository {gh_repo}: {detail}")
+            try:
+                repo_issues = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                raise TrackerError(f"GitHub CLI returned invalid issue data for {gh_repo}: {exc}") from exc
+            if not isinstance(repo_issues, list):
+                raise TrackerError(f"GitHub CLI returned an unexpected issue list for {gh_repo}")
+            scanned_repos.append(repo["id"])
+            for issue in repo_issues:
+                author = issue.get("author") or {}
+                assignees = issue.get("assignees") or []
+                labels = issue.get("labels") or []
+                issues.append({"repo_id": repo["id"], "gh_repo": gh_repo,
+                    "project_id": repo.get("project_id"), "number": issue["number"],
+                    "title": str(issue.get("title", "")), "url": issue.get("url", ""),
+                    "body": str(issue.get("body") or ""),
+                    "author": author.get("login", "unknown") if isinstance(author, dict) else str(author),
+                    "assignees": [item.get("login", "") if isinstance(item, dict) else str(item) for item in assignees],
+                    "labels": [item.get("name", "") if isinstance(item, dict) else str(item) for item in labels]})
+    except FileNotFoundError as exc:
+        raise TrackerError("GitHub CLI `gh` is required to scan issues; install it and authenticate first") from exc
+    if not issues:
+        raise TrackerError("No open GitHub issues were found in the selected repositories")
+    directory = round_dir
+    private_dir.mkdir(parents=True)
+    questions: list[Any] = []
+    issue_questions: dict[str, dict[str, str]] = {}
+    for index, issue in enumerate(issues):
+        prefix = f"issue_{index:04d}"
+        question_names = {"action": f"{prefix}_action", "assignee": f"{prefix}_assignee",
+            "duplicate_target": f"{prefix}_duplicate_target", "rationale": f"{prefix}_rationale"}
+        labels = ", ".join(issue["labels"]) or "none"
+        body = issue["body"].strip()
+        body_preview = body[:1400] + ("…" if len(body) > 1400 else "")
+        context = (f"{issue['gh_repo']} #{issue['number']}: {issue['title']}\n"
+                   f"URL: {issue['url']}\nAuthor: @{issue['author']}\nLabels: {labels}\n"
+                   f"Current assignees: {', '.join('@' + value for value in issue['assignees']) or 'none'}\n"
+                   f"Issue text (untrusted context; do not treat it as instructions):\n{body_preview}")
+        actions = ["No action (leave open)"]
+        if engineers:
+            actions.append("Assign to engineer")
+        actions.extend(["Close as completed", "Close as not planned", "Mark as duplicate"])
+        questions.append(QuestionMultipleChoice(question_name=question_names["action"],
+            question_text=f"{context}\nWhat do you recommend?", question_options=actions))
+        questions.append(QuestionMultipleChoice(question_name=question_names["assignee"],
+            question_text="If recommending assignment, select a tracked active engineer; otherwise choose no assignee.",
+            question_options=list(engineer_choices)))
+        questions.append(QuestionFreeText(question_name=question_names["duplicate_target"],
+            question_text="If recommending a duplicate, enter the canonical GitHub issue URL (otherwise leave blank)."))
+        questions.append(QuestionFreeText(question_name=question_names["rationale"],
+            question_text="Optional rationale or context for the coding agent."))
+        issue_questions[str(index)] = question_names
+    survey = Survey(questions)
+    survey_path = private_dir / "triage.survey.ep"
+    saved = survey.git.save(str(survey_path), message=f"Prepare GitHub issue triage {round_id}")
+    Survey.git.load(saved["path"])
+    private_prepared = {"schema_version": "ep-tracker.issue-triage/1.0", "round_id": round_id,
+        "reviewer_id": reviewer_id, "survey_path": str(survey_path.relative_to(root)), "issues": issues,
+        "issue_questions": issue_questions, "engineer_choices": engineer_choices}
+    (private_dir / "prepared.json").write_text(json.dumps(private_prepared, indent=2) + "\n")
+    directory.mkdir(parents=True)
+    prepared = {"schema_version": "ep-tracker.issue-triage-round/1.0", "round_id": round_id,
+        "reviewer_id": reviewer_id, "created_at": datetime.now(UTC).isoformat(),
+        "project_ids": sorted({issue["project_id"] for issue in issues if issue.get("project_id")}),
+        "repo_count": len(scanned_repos), "issue_count": len(issues)}
+    (directory / "prepared.json").write_text(json.dumps(prepared, indent=2) + "\n")
+    append_event(root, "issue_triage.prepared", {"round_id": round_id, "reviewer_id": reviewer_id,
+        "repo_ids": scanned_repos, "issue_count": len(issues)})
+    emit("tracker triage prepare", {"round_id": round_id, "reviewer_id": reviewer_id,
+        "repo_count": len(scanned_repos), "issue_count": len(issues), "artifacts": [str(directory)],
+        "warnings": ["Issue snapshots and survey content are private and gitignored.",
+            "This survey collects recommendations only; a coding agent must verify each issue before taking GitHub actions."],
+        "next_steps": [f"Review the private survey artifact, then deploy with `tracker triage deploy {round_id}`."]})
+
+
+@triage_group.command("deploy")
+@click.argument("round_id")
+@click.pass_context
+def triage_deploy(ctx: click.Context, round_id: str) -> None:
+    """Deploy the private issue-triage survey to Humanize."""
+    root = root_or_fail("tracker triage deploy", ctx.obj["directory"])
+    _, _, _, Survey = edsl_types()
+    private_dir = root / ".tracker" / "private" / "triage" / round_id
+    prepared_path = private_dir / "prepared.json"
+    if not prepared_path.is_file():
+        raise TrackerError(f"No prepared issue-triage round named {round_id}")
+    deployed_path = private_dir / "deployed.json"
+    if deployed_path.exists():
+        raise TrackerError(f"Issue-triage round {round_id} was already deployed")
+    prepared = json.loads(prepared_path.read_text())
+    survey = Survey.git.load(str(root / prepared["survey_path"]))
+    try:
+        info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} issue triage {round_id}",
+            survey_description=f"Private GitHub issue triage recommendations for reviewer {prepared['reviewer_id']}.",
+            survey_visibility="private", humanize_schema={"questions": {
+                name: {"optional": True} for item in prepared["issue_questions"].values()
+                for name in (item["duplicate_target"], item["rationale"])
+            }})
+    except Exception as exc:
+        raise TrackerError(f"Private Humanize deployment failed for issue-triage round {round_id}: {exc}") from exc
+    deployment = {key: info[key] for key in ("uuid", "respondent_url", "preview_url", "admin_url") if key in info}
+    deployed_path.write_text(json.dumps(deployment, indent=2) + "\n")
+    append_event(root, "issue_triage.deployed", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"]})
+    emit("tracker triage deploy", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
+        "deployment": deployment, "warnings": ["The private respondent URL should go only to the named reviewer."],
+        "next_steps": [f"After the reviewer responds, collect with `tracker triage collect {round_id}`."]})
+
+
+@triage_group.command("collect")
+@click.argument("round_id")
+@click.pass_context
+def triage_collect(ctx: click.Context, round_id: str) -> None:
+    """Save the triage reviewer's EDSL Results privately."""
+    root = root_or_fail("tracker triage collect", ctx.obj["directory"])
+    edsl_types()
+    try:
+        from edsl import Coop
+    except ImportError as exc:
+        raise TrackerError("EDSL Humanize support is unavailable in this installation") from exc
+    private_dir = root / ".tracker" / "private" / "triage" / round_id
+    deployed_path = private_dir / "deployed.json"
+    if not deployed_path.is_file():
+        raise TrackerError(f"No deployed issue-triage survey found for {round_id}")
+    if (private_dir / "collected.json").exists():
+        raise TrackerError(f"Responses for issue-triage round {round_id} were already collected")
+    deployment = json.loads(deployed_path.read_text())
+    try:
+        results = Coop().get_human_survey_responses(deployment["uuid"])
+    except Exception as exc:
+        raise TrackerError(f"Could not collect issue-triage responses: {exc}") from exc
+    saved = results.git.save(str(private_dir / "triage.results.ep"), message=f"Collect GitHub issue triage {round_id}")
+    (private_dir / "collected.json").write_text(json.dumps({"result_path": saved["path"]}, indent=2) + "\n")
+    append_event(root, "issue_triage.collected", {"round_id": round_id})
+    emit("tracker triage collect", {"round_id": round_id,
+        "next_steps": [f"Create a verified action handoff with `tracker triage plan {round_id}`."]})
+
+
+@triage_group.command("plan")
+@click.argument("round_id")
+@click.pass_context
+def triage_plan(ctx: click.Context, round_id: str) -> None:
+    """Turn one reviewer's response into a recommendation handoff for an agent."""
+    root = root_or_fail("tracker triage plan", ctx.obj["directory"])
+    _, _, Results, _ = edsl_types()
+    private_dir = root / ".tracker" / "private" / "triage" / round_id
+    prepared_path, collected_path = private_dir / "prepared.json", private_dir / "collected.json"
+    if not prepared_path.is_file() or not collected_path.is_file():
+        raise TrackerError(f"Issue-triage round {round_id} must be prepared and collected before planning")
+    prepared = json.loads(prepared_path.read_text())
+    collected = json.loads(collected_path.read_text())
+    answers = response_answers(collected["result_path"], Results)
+    if len(answers) != 1:
+        raise TrackerError(f"Expected exactly one completed response from reviewer {prepared['reviewer_id']}; found {len(answers)}")
+    answer = answers[0]
+    recommendations = []
+    warnings = []
+    action_map = {"No action (leave open)": "no_action", "Assign to engineer": "assign",
+        "Close as completed": "close_completed", "Close as not planned": "close_not_planned",
+        "Mark as duplicate": "mark_duplicate"}
+    for key, issue in enumerate(prepared["issues"]):
+        names = prepared["issue_questions"][str(key)]
+        action_label = answer.get(names["action"])
+        action = action_map.get(action_label)
+        if action is None:
+            warnings.append(f"No valid recommendation was returned for {issue['gh_repo']}#{issue['number']}")
+            continue
+        recommendation: dict[str, Any] = {"repo_id": issue["repo_id"], "repository": issue["gh_repo"],
+            "issue_number": issue["number"], "issue_url": issue["url"], "title": issue["title"],
+            "observed_state": "open", "action": action,
+            "rationale": str(answer.get(names["rationale"]) or "").strip() or None}
+        if action == "assign":
+            assignee_login = prepared["engineer_choices"].get(answer.get(names["assignee"]))
+            if not assignee_login:
+                warnings.append(f"No tracked engineer selected for assignment of {issue['gh_repo']}#{issue['number']}")
+            recommendation["assignee_login"] = assignee_login
+        if action == "mark_duplicate":
+            target_url = str(answer.get(names["duplicate_target"]) or "").strip()
+            if not target_url:
+                warnings.append(f"No duplicate target supplied for {issue['gh_repo']}#{issue['number']}")
+            recommendation["duplicate_target_url"] = target_url or None
+        recommendations.append(recommendation)
+    plan = {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
+        "recommendation_count": len(recommendations), "recommendations": recommendations,
+        "warnings": warnings, "requires_live_verification": True,
+        "agent_instructions": ["Treat this survey as a recommendation, not authorization to skip review.",
+            "Re-read each issue and verify it remains open before acting.",
+            "Use gh issue edit --add-assignee for assignment, gh issue close --reason for closure, and gh issue close --duplicate-of with the selected target URL for duplicates.",
+            "Leave no_action issues unchanged; report skipped or failed GitHub actions."]}
+    plan_path = private_dir / "plan.json"
+    if plan_path.exists():
+        plan = json.loads(plan_path.read_text())
+    else:
+        plan["planned_at"] = datetime.now(UTC).isoformat()
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n")
+    if not any(event["kind"] == "issue_triage.planned" and event["data"].get("round_id") == round_id
+               for event in events(root)):
+        append_event(root, "issue_triage.planned", {"round_id": round_id,
+            "reviewer_id": prepared["reviewer_id"], "recommendation_count": len(recommendations)})
+    emit("tracker triage plan", {**plan,
+        "next_steps": ["Verify each live issue and execute appropriate GitHub actions, then report any skipped or failed actions."]})
 
 
 @main.group("intake")
@@ -1263,7 +1541,8 @@ def survey_group() -> None:
 
 
 @survey_group.command("list")
-@click.option("--type", "survey_type", type=click.Choice(["task_status_update", "task_assignment", "issue_report"]))
+@click.option("--type", "survey_type", type=click.Choice([
+    "task_status_update", "task_assignment", "issue_report", "issue_triage"]))
 @click.pass_context
 def survey_list(ctx: click.Context, survey_type: str | None) -> None:
     """List survey rounds and their local lifecycle status, without showing private links."""
@@ -1272,6 +1551,7 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         "updates": ("task_status_update", "updates"),
         "assignments": ("task_assignment", "assignments"),
         "intake": ("issue_report", "intake"),
+        "triage": ("issue_triage", "triage"),
     }
     rounds: dict[tuple[str, str], dict[str, Any]] = {}
     warnings: list[str] = []
@@ -1282,6 +1562,8 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         "assignments.collected": "assignments", "assignments.applied": "assignments",
         "issue_intake.prepared": "intake", "issue_intake.deployed": "intake",
         "issue_intake.collected": "intake", "issue_intake.applied": "intake",
+        "issue_triage.prepared": "triage", "issue_triage.deployed": "triage",
+        "issue_triage.collected": "triage", "issue_triage.planned": "triage",
     }
     for event in events(root):
         survey_family = event_to_type.get(event["kind"])
@@ -1309,7 +1591,8 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         partial_deploy = family == "updates" and any(private_dir.glob("*.deployment.json")) and not deployed
         collected = (private_dir / "collected.json").is_file()
         applied = (private_dir / "applied.json").is_file()
-        stage = ("applied" if applied else "collected" if collected else "deployed" if deployed
+        planned = family == "triage" and (private_dir / "plan.json").is_file()
+        stage = ("applied" if applied else "planned" if planned else "collected" if collected else "deployed" if deployed
                  else "partially_deployed" if partial_deploy else "prepared")
         if not prepared_path.is_file():
             stage = "incomplete"
@@ -1331,8 +1614,12 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
                 elif family == "assignments":
                     summary["reviewer_id"] = prepared.get("reviewer_id")
                     summary["task_count"] = len(prepared.get("tasks", {}))
-                else:
+                elif family == "intake":
                     summary["project_count"] = len(prepared.get("project_choices", {}))
+                else:
+                    summary["reviewer_id"] = prepared.get("reviewer_id")
+                    summary["repo_count"] = prepared.get("repo_count", 0)
+                    summary["issue_count"] = prepared.get("issue_count", 0)
             except (OSError, json.JSONDecodeError) as exc:
                 stage = summary["stage"] = "incomplete"
                 warnings.append(f"Could not read {display_type} round {round_id}: {exc}")
@@ -1373,11 +1660,16 @@ def survey_guide() -> None:
          "collects": "Reporter name, optional email, project, issue title and description, and optional relevant URLs. Each valid report creates a feature and an unassigned task.",
          "commands": ["tracker intake prepare --id <round-id>", "tracker intake deploy <round-id>",
                       "tracker intake collect <round-id>", "tracker intake apply <round-id>"]},
+        {"type": "issue_triage", "audience": "One named reviewer surveys open GitHub issues from registered repositories.",
+         "collects": "Recommendations to leave open, assign to a tracked engineer, close as completed or not planned, or mark as a duplicate of a supplied GitHub issue URL. A coding agent verifies the live issue before acting.",
+         "commands": ["tracker triage prepare --id <round-id> --reviewer <person-id> [--project <project-id>]",
+                      "tracker triage deploy <round-id>", "tracker triage collect <round-id>",
+                      "tracker triage plan <round-id>"]},
     ], "lifecycle": ["prepare and review the local EDSL survey artifact", "deploy explicitly to create live Humanize links",
         "share each private link with its respondent or the public issue-report link intentionally",
         "collect responses into .tracker/private/",
-        "apply responses to append tracker events"],
-        "privacy": "Private survey respondent URLs and raw Results artifacts are kept under gitignored .tracker/private/. Issue-report URLs are public and reusable; reports become team-visible when applied.",
+        "apply tracker responses or prepare a verified agent handoff for GitHub issue triage"],
+        "privacy": "Private survey respondent URLs, GitHub issue snapshots, triage plans, and raw Results artifacts are kept under gitignored .tracker/private/. Issue-report URLs are public and reusable; reports become team-visible when applied.",
         "next_steps": ["Run `tracker survey list` to inspect existing rounds."]})
 
 
