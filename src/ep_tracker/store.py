@@ -87,6 +87,17 @@ def state(root: Path) -> dict[str, Any]:
                     task["latest_update"] = data["update"]
             else:
                 task["assignee_id"] = data.get("person_id")
+                if task.get("priority_rank_assignee_id") != data.get("person_id"):
+                    task.pop("priority_rank", None)
+                    task.pop("priority_rank_assignee_id", None)
+                    task.pop("priority_ranked_by", None)
+                    task.pop("priority_round", None)
+        elif kind == "task.priority_ranked":
+            task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
+            task["priority_rank"] = data["rank"]
+            task["priority_rank_assignee_id"] = data["person_id"]
+            task["priority_ranked_by"] = data.get("ranked_by")
+            task["priority_round"] = data.get("ranking_round")
         elif kind == "task.completion_suspected":
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
             task["completion_suspected"] = True

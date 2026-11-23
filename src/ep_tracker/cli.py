@@ -136,6 +136,7 @@ def guide() -> None:
         "tracker init → people/projects/repos → features/tasks → daily memo",
         "updates prepare → deploy → collect → apply task status updates",
         "assignments prepare → deploy → collect → apply the reviewer's task assignments",
+        "priorities prepare → deploy → collect → apply the CTO's per-engineer task rankings",
         "triage prepare → deploy → collect → plan recommendations → agent verifies and runs gh issue actions",
     ], "storage": "Team state is derived from immutable event files under .tracker/events/.",
         "agent_guidance": ["Run `tracker agent next` before acting and after each material change.",
@@ -534,6 +535,7 @@ def task_list(ctx: click.Context, assignee: str | None, status: str | None) -> N
         tasks = [item for item in tasks if item.get("assignee_id") == assignee]
     if status:
         tasks = [item for item in tasks if item.get("status") == status]
+    tasks.sort(key=lambda item: (item.get("assignee_id") or "~", *task_priority_sort_key(item)))
     emit("tracker task list", {"tasks": tasks})
 
 
@@ -601,6 +603,19 @@ def edsl_types() -> tuple[Any, Any, Any, Any]:
     except ImportError as exc:
         raise TrackerError("EDSL is required for survey workflows; install the fielding extra") from exc
     return QuestionFreeText, QuestionMultipleChoice, Results, Survey
+
+
+def edsl_rank_question_type() -> Any:
+    try:
+        from edsl import QuestionRank
+    except ImportError as exc:
+        raise TrackerError("EDSL is required for survey workflows; install the fielding extra") from exc
+    return QuestionRank
+
+
+def task_priority_sort_key(task: dict[str, Any]) -> tuple[Any, ...]:
+    rank = task.get("priority_rank")
+    return (rank is None, rank if rank is not None else 0, task.get("id", task.get("task_id", "")))
 
 
 def response_answers(result_path: str, Results: Any) -> list[dict[str, Any]]:
@@ -1535,6 +1550,215 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
     emit("tracker updates apply", {**applied, "next_steps": ["Review the task and feature status with `tracker memo build`."]})
 
 
+@main.group("priorities")
+def priorities_group() -> None:
+    """Rank engineers' tasks by team priority."""
+
+
+@priorities_group.command("prepare")
+@click.option("--id", "round_id", required=True)
+@click.option("--reviewer", "reviewer_id", required=True, help="CTO or other person ranking priorities.")
+@click.pass_context
+def priorities_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> None:
+    """Build a private ranking survey with one task list per engineer."""
+    root = root_or_fail("tracker priorities prepare", ctx.obj["directory"])
+    QuestionRank = edsl_rank_question_type()
+    _, _, _, Survey = edsl_types()
+    if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
+        raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
+    current = state(root)
+    check_id(reviewer_id, current["people"], "reviewer")
+    if not current["people"][reviewer_id].get("active", True):
+        raise TrackerError(f"Reviewer {reviewer_id} is inactive")
+    round_dir = root / ".tracker" / "priorities" / round_id
+    private_dir = root / ".tracker" / "private" / "priorities" / round_id
+    if round_dir.exists() or private_dir.exists():
+        raise TrackerError(f"Priority-ranking round already exists: {round_id}")
+    assigned_by_person: dict[str, list[dict[str, Any]]] = {}
+    for task in current["tasks"].values():
+        person_id = task.get("assignee_id")
+        person = current["people"].get(person_id, {})
+        if (person_id and person.get("role", "engineer").lower() == "engineer"
+                and task.get("status") not in {"done", "cancelled", "merged"}):
+            assigned_by_person.setdefault(person_id, []).append(task)
+    if not assigned_by_person:
+        raise TrackerError("There are no active tasks assigned to engineers to rank")
+    questions: list[Any] = []
+    engineers: dict[str, Any] = {}
+    for index, person_id in enumerate(sorted(assigned_by_person,
+            key=lambda pid: (current["people"][pid].get("display_name", pid).lower(), pid))):
+        person = current["people"][person_id]
+        tasks = sorted(assigned_by_person[person_id], key=task_priority_sort_key)
+        labels: list[str] = []
+        label_to_task: dict[str, str] = {}
+        for task in tasks:
+            feature = current["features"].get(task.get("feature_id"), {})
+            project_id = task_project_id(task, current["features"])
+            context = (f"feature: {feature['title']}" if feature else
+                       f"project: {project_id}" if project_id else "standalone")
+            label = (f"{task['id']} — {task['title']} [{task.get('status', 'open')}; "
+                     f"{task.get('kind', 'other')}; {context}]")
+            labels.append(label)
+            label_to_task[label] = task["id"]
+        question_name = f"engineer_{index:03d}_task_ranking"
+        questions.append(QuestionRank(question_name=question_name,
+            question_text=(f"Rank {person.get('display_name', person_id)}'s active tasks from highest to lowest team priority. "
+                           "Rank every task exactly once. The first task will appear first in priority-sorted reports."),
+            question_options=labels, num_selections=len(labels), include_comment=False))
+        engineers[person_id] = {"display_name": person.get("display_name", person_id),
+            "question_name": question_name, "label_to_task": label_to_task,
+            "task_ids": [task["id"] for task in tasks]}
+    survey = Survey(questions)
+    round_dir.mkdir(parents=True)
+    survey_path = round_dir / "task_priorities.survey.ep"
+    saved = survey.git.save(str(survey_path), message=f"Prepare task priority ranking {round_id}")
+    Survey.git.load(saved["path"])
+    manifest = {"schema_version": "ep-tracker.priority-round/1.0", "round_id": round_id,
+        "reviewer_id": reviewer_id, "created_at": datetime.now(UTC).isoformat(),
+        "survey_path": str(survey_path.relative_to(root)), "engineers": engineers,
+        "engineer_count": len(engineers), "task_count": sum(len(item["task_ids"]) for item in engineers.values())}
+    (round_dir / "prepared.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    append_event(root, "priorities.prepared", {"round_id": round_id, "reviewer_id": reviewer_id,
+        "engineer_count": manifest["engineer_count"], "task_count": manifest["task_count"]})
+    emit("tracker priorities prepare", {"round_id": round_id, "reviewer_id": reviewer_id,
+        "engineer_count": manifest["engineer_count"], "task_count": manifest["task_count"],
+        "survey_path": str(survey_path), "artifacts": [str(round_dir)],
+        "next_steps": [f"Review the ranking survey, then deploy with `tracker priorities deploy {round_id}`."]})
+
+
+@priorities_group.command("deploy")
+@click.argument("round_id")
+@click.pass_context
+def priorities_deploy(ctx: click.Context, round_id: str) -> None:
+    """Deploy the priority-ranking survey privately to its named reviewer."""
+    root = root_or_fail("tracker priorities deploy", ctx.obj["directory"])
+    _, _, _, Survey = edsl_types()
+    round_dir = root / ".tracker" / "priorities" / round_id
+    prepared_path = round_dir / "prepared.json"
+    if not prepared_path.is_file():
+        raise TrackerError(f"No prepared priority-ranking round named {round_id}")
+    private_dir = root / ".tracker" / "private" / "priorities" / round_id
+    private_dir.mkdir(parents=True, exist_ok=True)
+    deployed_path = private_dir / "deployed.json"
+    if deployed_path.exists():
+        raise TrackerError(f"Priority-ranking round {round_id} was already deployed")
+    prepared = json.loads(prepared_path.read_text())
+    survey = Survey.git.load(str(root / prepared["survey_path"]))
+    try:
+        info = survey.humanize(human_survey_name=f"{read_config(root)['team_name']} task priorities {round_id}",
+            survey_description=f"Private task-priority rankings for reviewer {prepared['reviewer_id']}.",
+            survey_visibility="private")
+    except Exception as exc:
+        raise TrackerError(f"Private Humanize deployment failed for priority-ranking round {round_id}: {exc}") from exc
+    deployment = {key: info[key] for key in ("uuid", "respondent_url", "preview_url", "admin_url") if key in info}
+    deployed_path.write_text(json.dumps(deployment, indent=2) + "\n")
+    append_event(root, "priorities.deployed", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"]})
+    emit("tracker priorities deploy", {"round_id": round_id, "reviewer_id": prepared["reviewer_id"],
+        "deployment": deployment, "warnings": ["Send this private respondent URL only to the named reviewer."],
+        "next_steps": [f"After the reviewer ranks the tasks, collect with `tracker priorities collect {round_id}`."]})
+
+
+@priorities_group.command("collect")
+@click.argument("round_id")
+@click.pass_context
+def priorities_collect(ctx: click.Context, round_id: str) -> None:
+    """Collect the reviewer's private priority-ranking response."""
+    root = root_or_fail("tracker priorities collect", ctx.obj["directory"])
+    edsl_types()
+    try:
+        from edsl import Coop
+    except ImportError as exc:
+        raise TrackerError("EDSL Humanize support is unavailable in this installation") from exc
+    private_dir = root / ".tracker" / "private" / "priorities" / round_id
+    deployed_path = private_dir / "deployed.json"
+    if not deployed_path.is_file():
+        raise TrackerError(f"No deployed priority-ranking survey found for {round_id}")
+    if (private_dir / "collected.json").exists():
+        raise TrackerError(f"Responses for priority-ranking round {round_id} were already collected")
+    deployment = json.loads(deployed_path.read_text())
+    try:
+        results = Coop().get_human_survey_responses(deployment["uuid"])
+    except Exception as exc:
+        raise TrackerError(f"Could not collect priority-ranking responses: {exc}") from exc
+    saved = results.git.save(str(private_dir / "task_priorities.results.ep"),
+        message=f"Collect task priority ranking {round_id}")
+    (private_dir / "collected.json").write_text(json.dumps({"result_path": saved["path"]}, indent=2) + "\n")
+    append_event(root, "priorities.collected", {"round_id": round_id})
+    emit("tracker priorities collect", {"round_id": round_id,
+        "next_steps": [f"Apply the CTO's rankings with `tracker priorities apply {round_id}`."]})
+
+
+@priorities_group.command("apply")
+@click.argument("round_id")
+@click.pass_context
+def priorities_apply(ctx: click.Context, round_id: str) -> None:
+    """Append each ranked task's priority and use it in task reports."""
+    root = root_or_fail("tracker priorities apply", ctx.obj["directory"])
+    _, _, Results, _ = edsl_types()
+    round_dir = root / ".tracker" / "priorities" / round_id
+    private_dir = root / ".tracker" / "private" / "priorities" / round_id
+    prepared_path, collected_path = round_dir / "prepared.json", private_dir / "collected.json"
+    applied_path = private_dir / "applied.json"
+    if not prepared_path.is_file() or not collected_path.is_file():
+        raise TrackerError(f"Priority-ranking round {round_id} must be prepared and collected before applying")
+    if applied_path.exists():
+        raise TrackerError(f"Priority-ranking round {round_id} was already applied")
+    prepared = json.loads(prepared_path.read_text())
+    collected = json.loads(collected_path.read_text())
+    answers = response_answers(collected["result_path"], Results)
+    if len(answers) != 1:
+        raise TrackerError(f"Expected exactly one completed response from reviewer {prepared['reviewer_id']}; found {len(answers)}")
+    answer = answers[0]
+    current = state(root)
+    existing = {(event["data"].get("ranking_round"), event["data"].get("task_id"))
+        for event in events(root) if event["kind"] == "task.priority_ranked"}
+    summary: dict[str, Any] = {"round_id": round_id, "ranked_task_count": 0, "warnings": []}
+    for person_id, item in prepared["engineers"].items():
+        raw_ranking = answer.get(item["question_name"])
+        labels = list(item["label_to_task"])
+        if isinstance(raw_ranking, dict):
+            ordered: list[Any] = [label for label, _ in sorted(raw_ranking.items(), key=lambda pair: pair[1])]
+        elif isinstance(raw_ranking, list):
+            ordered = list(raw_ranking)
+            if ordered and all(isinstance(value, int) for value in ordered):
+                if any(value < 0 or value >= len(labels) for value in ordered):
+                    summary["warnings"].append(f"Ranking for {person_id} contains an out-of-range option index")
+                    continue
+                ordered = [labels[value] for value in ordered]
+        else:
+            summary["warnings"].append(f"No valid ranking was returned for engineer {person_id}")
+            continue
+        if (not all(isinstance(value, str) for value in ordered) or len(ordered) != len(labels)
+                or len(set(ordered)) != len(labels) or set(ordered) != set(labels)):
+            summary["warnings"].append(f"Ranking for {person_id} did not include every task exactly once")
+            continue
+        label_to_task = item["label_to_task"]
+        for rank, label in enumerate(ordered, start=1):
+            task_id = label_to_task[label]
+            task = current["tasks"].get(task_id)
+            if task is None:
+                summary["warnings"].append(f"Task {task_id} no longer exists")
+                continue
+            if task.get("assignee_id") != person_id:
+                summary["warnings"].append(f"Task {task_id} was reassigned since the ranking survey was prepared")
+                continue
+            if task.get("status") in {"done", "cancelled", "merged"}:
+                summary["warnings"].append(f"Task {task_id} is no longer active; its ranking was skipped")
+                continue
+            if (round_id, task_id) in existing:
+                continue
+            append_event(root, "task.priority_ranked", {"task_id": task_id, "person_id": person_id,
+                "rank": rank, "ranked_by": prepared["reviewer_id"], "ranking_round": round_id})
+            existing.add((round_id, task_id))
+            summary["ranked_task_count"] += 1
+    summary["applied_at"] = datetime.now(UTC).isoformat()
+    applied_path.write_text(json.dumps(summary, indent=2) + "\n")
+    append_event(root, "priorities.applied", {"round_id": round_id,
+        "reviewer_id": prepared["reviewer_id"], "ranked_task_count": summary["ranked_task_count"]})
+    emit("tracker priorities apply", {**summary,
+        "next_steps": ["Review task ordering with `tracker task list` or `tracker memo build`."]})
+
+
 @main.group("survey")
 def survey_group() -> None:
     """List survey rounds and explain the available survey workflows."""
@@ -1542,7 +1766,7 @@ def survey_group() -> None:
 
 @survey_group.command("list")
 @click.option("--type", "survey_type", type=click.Choice([
-    "task_status_update", "task_assignment", "issue_report", "issue_triage"]))
+    "task_status_update", "task_assignment", "issue_report", "issue_triage", "task_priority_ranking"]))
 @click.pass_context
 def survey_list(ctx: click.Context, survey_type: str | None) -> None:
     """List survey rounds and their local lifecycle status, without showing private links."""
@@ -1552,6 +1776,7 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         "assignments": ("task_assignment", "assignments"),
         "intake": ("issue_report", "intake"),
         "triage": ("issue_triage", "triage"),
+        "priorities": ("task_priority_ranking", "priorities"),
     }
     rounds: dict[tuple[str, str], dict[str, Any]] = {}
     warnings: list[str] = []
@@ -1564,6 +1789,8 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
         "issue_intake.collected": "intake", "issue_intake.applied": "intake",
         "issue_triage.prepared": "triage", "issue_triage.deployed": "triage",
         "issue_triage.collected": "triage", "issue_triage.planned": "triage",
+        "priorities.prepared": "priorities", "priorities.deployed": "priorities",
+        "priorities.collected": "priorities", "priorities.applied": "priorities",
     }
     for event in events(root):
         survey_family = event_to_type.get(event["kind"])
@@ -1616,6 +1843,10 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
                     summary["task_count"] = len(prepared.get("tasks", {}))
                 elif family == "intake":
                     summary["project_count"] = len(prepared.get("project_choices", {}))
+                elif family == "priorities":
+                    summary["reviewer_id"] = prepared.get("reviewer_id")
+                    summary["engineer_count"] = prepared.get("engineer_count", 0)
+                    summary["task_count"] = prepared.get("task_count", 0)
                 else:
                     summary["reviewer_id"] = prepared.get("reviewer_id")
                     summary["repo_count"] = prepared.get("repo_count", 0)
@@ -1665,6 +1896,11 @@ def survey_guide() -> None:
          "commands": ["tracker triage prepare --id <round-id> --reviewer <person-id> [--project <project-id>]",
                       "tracker triage deploy <round-id>", "tracker triage collect <round-id>",
                       "tracker triage plan <round-id>"]},
+        {"type": "task_priority_ranking", "audience": "One named CTO or reviewer ranks active tasks grouped by engineer.",
+         "collects": "A complete high-to-low ranking for each engineer. The latest ranking is stored as append-only task events and sorts tasks in task lists and daily memos; unranked tasks follow ranked tasks.",
+         "commands": ["tracker priorities prepare --id <round-id> --reviewer <person-id>",
+                      "tracker priorities deploy <round-id>", "tracker priorities collect <round-id>",
+                      "tracker priorities apply <round-id>"]},
     ], "lifecycle": ["prepare and review the local EDSL survey artifact", "deploy explicitly to create live Humanize links",
         "share each private link with its respondent or the public issue-report link intentionally",
         "collect responses into .tracker/private/",
@@ -1697,6 +1933,23 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
             person = people.get(feature.get("assignee_id"), {})
             lines.append(f"- **{feature['title']}** (`{feature['id']}`) — {person.get('display_name', 'unassigned')}")
         lines.append("")
+    lines.extend(["## Priority order by engineer", ""])
+    active_by_person: dict[str, list[dict[str, Any]]] = {}
+    for task in current["tasks"].values():
+        person_id = task.get("assignee_id")
+        person = people.get(person_id, {})
+        if (person_id and person.get("role", "engineer").lower() == "engineer"
+                and task.get("status") not in {"done", "cancelled", "merged"}):
+            active_by_person.setdefault(person_id, []).append(task)
+    for person_id, tasks in sorted(active_by_person.items(),
+            key=lambda pair: (people.get(pair[0], {}).get("display_name", pair[0]).lower(), pair[0])):
+        heading = people.get(person_id, {}).get("display_name", person_id)
+        lines.extend([f"### {heading}", ""])
+        for task in sorted(tasks, key=task_priority_sort_key):
+            rank = task.get("priority_rank")
+            priority = f"Priority {rank}" if rank is not None else "Unranked"
+            lines.append(f"- {priority} — {task['title']} (`{task['id']}`, {task.get('status', 'open')})")
+        lines.append("")
     lines.extend(["## Tasks by status and assignee", ""])
     grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
     for task in current["tasks"].values():
@@ -1706,6 +1959,7 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
     for status, assignees in sorted(grouped.items()):
         lines.extend([f"### {status}", ""])
         for person_id, tasks in sorted(assignees.items()):
+            tasks.sort(key=task_priority_sort_key)
             heading = people.get(person_id, {}).get("display_name", "Unassigned") if person_id != "unassigned" else "Unassigned"
             lines.extend([f"#### {heading}", ""])
             for task in tasks:

@@ -17,9 +17,11 @@ JSON or event files by hand.
 - **Tasks** are actionable work. They may belong to a feature or stand alone;
   an optional project can group a standalone task. A task can be assigned to a
   person and can represent building, reviewing, or approving work.
-- **Surveys** collect task updates, allocate unassigned work, or report new
-  issues. Survey responses become tracker events only when explicitly applied.
-- **Daily memos** summarize features and tasks by status in a dated snapshot.
+- **Surveys** collect task updates, allocate unassigned work, report new
+  issues, and rank task priorities. Survey responses become tracker events only
+  when explicitly applied.
+- **Daily memos** summarize features and tasks by status, including each
+  engineer's priority order, in a dated snapshot.
 
 ```mermaid
 flowchart TD
@@ -37,6 +39,8 @@ flowchart TD
     Engineer -->|personal status survey| Updates[Keep current status or change it; add notes]
     Task -->|unassigned| Allocation[Reviewer allocation survey]
     Allocation -->|assign, defer, flag for verification, or merge| Task
+    CTO[CTO or reviewer] -->|rank tasks per engineer| Priorities[Priority ranking survey]
+    Priorities -->|collect, then apply| Events
     Updates -->|collect, then apply| Events[Append-only event history]
     Allocation -->|collect, then apply| Events
     New --> Events
@@ -366,6 +370,30 @@ issue_triage` to see the round's lifecycle. See the GitHub CLI references for
 [`gh issue edit`](https://cli.github.com/manual/gh_issue_edit), and
 [`gh issue close`](https://cli.github.com/manual/gh_issue_close).
 
+### Rank task priorities
+
+A CTO or other named reviewer can rank each engineer's active tasks from
+highest to lowest priority. The survey has one ranking question per engineer;
+rank 1 is the highest priority. Rankings are scoped to each engineer rather
+than compared across the team. Applying a round appends one event per task.
+Task lists and daily memos show ranked tasks first, in rank order, followed by
+unranked active tasks. A new ranking round supersedes prior ranks, and
+reassigning a task clears its old rank.
+
+```bash
+tracker priorities prepare --id q4-priorities --reviewer cto
+tracker priorities deploy q4-priorities
+# Send the private respondent URL to the named reviewer.
+tracker priorities collect q4-priorities
+tracker priorities apply q4-priorities
+tracker task list --assignee alex
+tracker memo build
+```
+
+The survey includes active tasks assigned to people with the `engineer` role;
+done, cancelled, and merged tasks are omitted. Use `tracker survey list
+--type task_priority_ranking` to inspect the round's lifecycle.
+
 ### Survey discovery and privacy
 
 Use `tracker survey guide` for the available survey types and exact commands.
@@ -378,6 +406,7 @@ tracker survey list --type issue_triage
 tracker survey list --type issue_report
 tracker survey list --type task_assignment
 tracker survey list --type task_status_update
+tracker survey list --type task_priority_ranking
 ```
 
 Private respondent links and raw Results artifacts are stored under
@@ -394,9 +423,10 @@ Build a dated team snapshot with:
 tracker memo build
 ```
 
-The memo groups features and tasks by status and preserves each date as an
-immutable Markdown snapshot. To create another snapshot after one has been
-made for a date, choose a different date.
+The memo groups features and tasks by status, and adds a priority-order section
+for each engineer. It preserves each date as an immutable Markdown snapshot.
+To create another snapshot after one has been made for a date, choose a
+different date.
 
 ## Agent guidance
 
