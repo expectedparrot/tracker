@@ -58,7 +58,7 @@ def events(root: Path) -> list[dict[str, Any]]:
 
 
 def state(root: Path) -> dict[str, Any]:
-    result: dict[str, Any] = {"people": {}, "projects": {}, "repos": {}, "features": {}, "tasks": {},
+    result: dict[str, Any] = {"people": {}, "repos": {}, "tasks": {},
                               "pull_requests": [], "assignment_requests": [], "team_updates": []}
     for event in events(root):
         kind, data = event["kind"], event["data"]
@@ -67,17 +67,14 @@ def state(root: Path) -> dict[str, Any]:
             person.update(data)
             if kind in {"person.created", "person.deactivated"}:
                 person["active"] = kind == "person.created"
-        elif kind in {"project.created", "project.updated"}:
-            result["projects"].setdefault(data["project_id"], {"id": data["project_id"]}).update(data)
         elif kind == "repo.linked":
-            result["repos"].setdefault(data["repo_id"], {"id": data["repo_id"]}).update(data)
-        elif kind in {"feature.created", "feature.status_changed"}:
-            feature = result["features"].setdefault(data["feature_id"], {"id": data["feature_id"]})
-            feature.update(data)
-        elif kind == "feature.assigned":
-            result["features"].setdefault(data["feature_id"], {"id": data["feature_id"]})["assignee_id"] = data["person_id"]
+            result["repos"].setdefault(data["repo_id"], {"id": data["repo_id"]}).update(
+                {key: value for key, value in data.items() if key != "project_id"})
         elif kind == "task.created":
-            result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]}).update(data)
+            task_fields = {"task_id", "title", "kind", "assignee_id", "repo_ids", "status", "description",
+                "related_urls", "reported_by", "reporter_email", "source", "intake_round", "intake_response_key"}
+            result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]}).update(
+                {key: value for key, value in data.items() if key in task_fields})
         elif kind in {"task.status_changed", "task.assigned"}:
             task = result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]})
             if kind == "task.status_changed":
@@ -118,7 +115,9 @@ def state(root: Path) -> dict[str, Any]:
         elif kind == "person.update_reported":
             result["team_updates"].append(data)
         elif kind == "pull_request.linked":
-            result["pull_requests"].append(data)
+            if data.get("task_id"):
+                result["pull_requests"].append(data)
+                result["tasks"].setdefault(data["task_id"], {"id": data["task_id"]}).setdefault("pull_requests", []).append(data)
         elif kind in {"task.claim_requested", "task.assignment_proposed"}:
             result["assignment_requests"].append({**data, "kind": kind, "event_id": event["event_id"]})
         elif kind == "task.request_resolved":

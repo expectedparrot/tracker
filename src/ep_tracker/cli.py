@@ -56,12 +56,9 @@ def check_id(identifier: str, collection: dict[str, Any], label: str) -> None:
         raise TrackerError(f"Unknown {label} ID: {identifier}")
 
 
-def task_project_id(task: dict[str, Any], features: dict[str, Any]) -> str | None:
-    """Return a task's explicit or feature-inherited project, if any."""
-    if task.get("project_id"):
-        return task["project_id"]
-    feature = features.get(task.get("feature_id"), {})
-    return feature.get("project_id")
+def task_repo_ids(task: dict[str, Any]) -> list[str]:
+    """Return repositories directly linked to a task."""
+    return list(task.get("repo_ids", []))
 
 
 def github_repo_slug(repo_url: str) -> str:
@@ -125,7 +122,7 @@ def init_tracker(ctx: click.Context, directory: Path | None, name: str, team_id:
         subprocess.run(["git", "init", str(target)], check=True, capture_output=True, text=True)
     emit("tracker init", {"tracker": config, "path": str(target), "warnings": guidance_warning, "next_steps": [
         f"Add team members with `tracker person add --id <handle> --name <name>` from {target}.",
-        "Add projects and repositories, then create features and tasks.",
+        "Register repositories, then create and assign tasks.",
     ]})
 
 
@@ -133,7 +130,7 @@ def init_tracker(ctx: click.Context, directory: Path | None, name: str, team_id:
 def guide() -> None:
     """Describe the tracker lifecycle and important command boundaries."""
     emit("tracker guide", {"lifecycle": [
-        "tracker init → people/projects/repos → features/tasks → daily memo",
+        "tracker init → people/repos → tasks → daily memo",
         "updates prepare → deploy → collect → apply task status updates",
         "assignments prepare → deploy → collect → apply the reviewer's task assignments",
         "priorities prepare → deploy → collect → apply the CTO's per-engineer task rankings",
@@ -168,7 +165,7 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         return
     current = state(root)
     history = events(root)
-    counts = {name: len(current[name]) for name in ("people", "projects", "repos", "features", "tasks")}
+    counts = {name: len(current[name]) for name in ("people", "repos", "tasks")}
     planned_triage_rounds = {event["data"].get("round_id") for event in history
         if event["kind"] == "issue_triage.planned"}
     pending_triage_rounds = sorted({event["data"].get("round_id") for event in history
@@ -178,14 +175,9 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         stage, recommendation = "setup-people", "Register the team's engineers and other task owners."
         steps = ["Collect each person's stable ID, display name, and optional GitHub handle.",
                  "Run `tracker person add --id <id> --name <name> [--github <handle>]` for each person."]
-    elif not current["projects"]:
-        stage, recommendation = "setup-projects", "Add projects and the repositories they span."
-        steps = ["Add a project with `tracker project add --id <id> --name <name>`.",
-                 "Link each code repository with `tracker project repo --id <repo-id> --project <project-id> --url <url>`."]
     elif not current["repos"]:
-        stage, recommendation = "link-repositories", "Link the code repositories this team tracks."
-        steps = ["Inspect projects with `tracker project list`.",
-                 "Link repositories with `tracker project repo --id <repo-id> --project <project-id> --url <url>`."]
+        stage, recommendation = "link-repositories", "Register the code repositories this team tracks."
+        steps = ["Register a repository with `tracker repo add --id <id> --url <url>`. "]
     elif current["assignment_requests"]:
         stage, recommendation = "review-assignments", "Review pending task claims and assignment proposals."
         steps = ["Inspect requests with `tracker task requests`.",
@@ -194,10 +186,9 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         stage, recommendation = "process-issue-triage", "Review the collected GitHub issue triage recommendations."
         steps = [f"Build the agent handoff with `tracker triage plan {pending_triage_rounds[-1]}`.",
                  "Verify each issue's live state and selected target, then execute appropriate GitHub actions."]
-    elif not current["features"]:
-        stage, recommendation = "setup-features", "Create the team's first feature and its tasks."
-        steps = ["Create a feature with `tracker feature create --id <id> --project <project-id> --title <title>`.",
-                 "Add build, review, or approval work with `tracker task create`."]
+    elif not current["tasks"]:
+        stage, recommendation = "setup-tasks", "Create the team's first task."
+        steps = ["Create work with `tracker task create --id <id> --title <title> --assignee <person-id>`. "]
     elif any(task.get("completion_suspected") for task in current["tasks"].values()):
         stage, recommendation = "verify-completion", "Check tasks the assignment reviewer thinks may already be complete."
         suspected_ids = [task["id"] for task in current["tasks"].values() if task.get("completion_suspected")]
@@ -217,7 +208,7 @@ def agent_next(ctx: click.Context, command: str = "tracker agent next") -> None:
         else:
             stage, recommendation = "current", "Tracker state is current; review recent activity or start the next update round."
             steps = ["Inspect survey rounds with `tracker survey list` and recent events with `tracker history`.",
-                     "Start the next status round with `tracker updates prepare --id <round-id>` or assignment round with `tracker assignments prepare --id <round-id> --reviewer <person-id>`. "]
+                     "Start a status round with `tracker updates prepare --id <round-id>`, an assignment round with `tracker assignments prepare --id <round-id> --reviewer <person-id>`, or a priority round with `tracker priorities prepare --id <round-id> --reviewer <person-id>`. "]
     emit(command, {"stage": stage, "tracker": read_config(root), "counts": counts,
         "recommendation": recommendation, "next_steps": steps})
 
@@ -235,16 +226,12 @@ def status_command(ctx: click.Context) -> None:
     """Show a compact current view of team work."""
     root = root_or_fail("tracker status", ctx.obj["directory"])
     current = state(root)
-    feature_counts: dict[str, int] = {}
     task_counts: dict[str, int] = {}
-    for item in current["features"].values():
-        key = item.get("status", "planned")
-        feature_counts[key] = feature_counts.get(key, 0) + 1
     for item in current["tasks"].values():
         key = item.get("status", "open")
         task_counts[key] = task_counts.get(key, 0) + 1
-    emit("tracker status", {"team": read_config(root), "feature_counts": feature_counts,
-        "task_counts": task_counts, "unassigned_tasks": [item for item in current["tasks"].values()
+    emit("tracker status", {"team": read_config(root), "task_counts": task_counts,
+        "unassigned_tasks": [item for item in current["tasks"].values()
             if not item.get("assignee_id") and item.get("status") not in {"done", "cancelled", "merged"}],
         "completion_suspected": [item for item in current["tasks"].values() if item.get("completion_suspected")],
         "assignment_requests": current["assignment_requests"]})
@@ -318,141 +305,32 @@ def person_deactivate(ctx: click.Context, person_id: str) -> None:
     emit("tracker person deactivate", {"person_id": person_id, "active": False})
 
 
-@main.group("project")
-def project_group() -> None:
-    """Manage projects and participating repositories."""
+@main.group("repo")
+def repo_group() -> None:
+    """Register and list the team's code repositories."""
 
 
-@project_group.command("add")
-@click.option("--id", "project_id", required=True)
-@click.option("--name", required=True)
-@click.pass_context
-def project_add(ctx: click.Context, project_id: str, name: str) -> None:
-    root = root_or_fail("tracker project add", ctx.obj["directory"])
-    validate_id(project_id, "Project ID")
-    if project_id in state(root)["projects"]:
-        fail("tracker project add", "project_exists", f"Project {project_id} already exists.")
-    append_event(root, "project.created", {"project_id": project_id, "name": name})
-    emit("tracker project add", {"project": {"id": project_id, "name": name}})
-
-
-@project_group.command("repo")
+@repo_group.command("add")
 @click.option("--id", "repo_id", required=True)
-@click.option("--project", "project_id", required=True)
 @click.option("--url", required=True)
 @click.pass_context
-def repo_add(ctx: click.Context, repo_id: str, project_id: str, url: str) -> None:
-    root = root_or_fail("tracker project repo", ctx.obj["directory"])
+def repo_add_direct(ctx: click.Context, repo_id: str, url: str) -> None:
+    root = root_or_fail("tracker repo add", ctx.obj["directory"])
     validate_id(repo_id, "Repository ID")
     current = state(root)
-    check_id(project_id, current["projects"], "project")
     if repo_id in current["repos"]:
-        fail("tracker project repo", "repo_exists", f"Repository {repo_id} already exists.")
-    data = {"repo_id": repo_id, "project_id": project_id, "url": url}
+        fail("tracker repo add", "repo_exists", f"Repository {repo_id} already exists.")
+    data = {"repo_id": repo_id, "url": url}
     append_event(root, "repo.linked", data)
-    emit("tracker project repo", {"repo": data})
+    emit("tracker repo add", {"repo": data})
 
 
-@project_group.command("list")
+@repo_group.command("list")
 @click.pass_context
-def project_list(ctx: click.Context) -> None:
-    root = root_or_fail("tracker project list", ctx.obj["directory"])
-    current = state(root)
-    projects = []
-    for project in current["projects"].values():
-        projects.append({**project, "repositories": [repo for repo in current["repos"].values() if repo["project_id"] == project["id"]]})
-    emit("tracker project list", {"projects": projects})
-
-
-@main.group("feature")
-def feature_group() -> None:
-    """Create and update features."""
-
-
-@feature_group.command("create")
-@click.option("--id", "feature_id", required=True)
-@click.option("--project", "project_id", required=True)
-@click.option("--title", required=True)
-@click.option("--assignee")
-@click.pass_context
-def feature_create(ctx: click.Context, feature_id: str, project_id: str, title: str, assignee: str | None) -> None:
-    root = root_or_fail("tracker feature create", ctx.obj["directory"])
-    validate_id(feature_id, "Feature ID")
-    current = state(root)
-    check_id(project_id, current["projects"], "project")
-    if feature_id in current["features"]:
-        fail("tracker feature create", "feature_exists", f"Feature {feature_id} already exists.")
-    if assignee:
-        check_id(assignee, current["people"], "person")
-    data = {"feature_id": feature_id, "project_id": project_id, "title": title, "status": "planned", "assignee_id": assignee}
-    append_event(root, "feature.created", data)
-    feature_dir = root / "projects" / project_id / "features" / feature_id
-    feature_dir.mkdir(parents=True, exist_ok=True)
-    readme_path = feature_dir / "README.md"
-    if not readme_path.exists():
-        readme_path.write_text(f"# {title}\n\n")
-    (feature_dir / "images").mkdir(exist_ok=True)
-    emit("tracker feature create", {"feature": data, "artifacts": [str(readme_path), str(feature_dir / "images")]})
-
-
-@feature_group.command("list")
-@click.option("--project", "project_id")
-@click.option("--status")
-@click.pass_context
-def feature_list(ctx: click.Context, project_id: str | None, status: str | None) -> None:
-    root = root_or_fail("tracker feature list", ctx.obj["directory"])
-    current = state(root)
-    features = list(current["features"].values())
-    if project_id:
-        features = [item for item in features if item.get("project_id") == project_id]
-    if status:
-        features = [item for item in features if item.get("status") == status]
-    for feature in features:
-        feature["pull_requests"] = [pr for pr in current["pull_requests"] if pr["feature_id"] == feature["id"]]
-        feature["tasks"] = [task for task in current["tasks"].values() if task["feature_id"] == feature["id"]]
-    emit("tracker feature list", {"features": features})
-
-
-@feature_group.command("status")
-@click.argument("feature_id")
-@click.argument("status", type=click.Choice(["planned", "in_progress", "blocked", "done", "cancelled"]))
-@click.pass_context
-def feature_status(ctx: click.Context, feature_id: str, status: str) -> None:
-    root = root_or_fail("tracker feature status", ctx.obj["directory"])
-    check_id(feature_id, state(root)["features"], "feature")
-    append_event(root, "feature.status_changed", {"feature_id": feature_id, "status": status})
-    emit("tracker feature status", {"feature_id": feature_id, "status": status})
-
-
-@feature_group.command("assign")
-@click.argument("feature_id")
-@click.argument("person_id")
-@click.pass_context
-def feature_assign(ctx: click.Context, feature_id: str, person_id: str) -> None:
-    root = root_or_fail("tracker feature assign", ctx.obj["directory"])
-    current = state(root)
-    check_id(feature_id, current["features"], "feature")
-    check_id(person_id, current["people"], "person")
-    append_event(root, "feature.assigned", {"feature_id": feature_id, "person_id": person_id})
-    emit("tracker feature assign", {"feature_id": feature_id, "person_id": person_id})
-
-
-@feature_group.command("pr")
-@click.argument("feature_id")
-@click.option("--repo", "repo_id", required=True)
-@click.option("--url", required=True)
-@click.option("--number")
-@click.pass_context
-def feature_pr(ctx: click.Context, feature_id: str, repo_id: str, url: str, number: str | None) -> None:
-    root = root_or_fail("tracker feature pr", ctx.obj["directory"])
-    current = state(root)
-    check_id(feature_id, current["features"], "feature")
-    check_id(repo_id, current["repos"], "repo")
-    if current["features"][feature_id]["project_id"] != current["repos"][repo_id]["project_id"]:
-        raise TrackerError(f"Repository {repo_id} does not belong to feature {feature_id}'s project")
-    data = {"feature_id": feature_id, "repo_id": repo_id, "url": url, "number": number}
-    append_event(root, "pull_request.linked", data)
-    emit("tracker feature pr", {"pull_request": data})
+def repo_list(ctx: click.Context) -> None:
+    root = root_or_fail("tracker repo list", ctx.obj["directory"])
+    repositories = list(state(root)["repos"].values())
+    emit("tracker repo list", {"repositories": repositories})
 
 
 @main.group("task")
@@ -462,33 +340,49 @@ def task_group() -> None:
 
 @task_group.command("create")
 @click.option("--id", "task_id", required=True)
-@click.option("--feature", "feature_id", help="Optional feature this task belongs to.")
-@click.option("--project", "project_id", help="Optional project for a task without a feature.")
 @click.option("--title", required=True)
 @click.option("--kind", type=click.Choice(["build", "review", "approve", "other"]), default="build")
 @click.option("--assignee")
+@click.option("--repo", "repo_ids", multiple=True, help="Repository related to this task; may be repeated.")
 @click.pass_context
-def task_create(ctx: click.Context, task_id: str, feature_id: str | None, project_id: str | None,
-                title: str, kind: str, assignee: str | None) -> None:
+def task_create(ctx: click.Context, task_id: str, title: str, kind: str, assignee: str | None,
+                repo_ids: tuple[str, ...]) -> None:
     root = root_or_fail("tracker task create", ctx.obj["directory"])
     validate_id(task_id, "Task ID")
     current = state(root)
     if task_id in current["tasks"]:
         fail("tracker task create", "task_exists", f"Task {task_id} already exists.")
-    if feature_id:
-        check_id(feature_id, current["features"], "feature")
-        feature_project = current["features"][feature_id].get("project_id")
-        if project_id and project_id != feature_project:
-            raise TrackerError(f"Feature {feature_id} belongs to project {feature_project}, not {project_id}")
-        project_id = feature_project
-    elif project_id:
-        check_id(project_id, current["projects"], "project")
     if assignee:
         check_id(assignee, current["people"], "person")
-    data = {"task_id": task_id, "feature_id": feature_id, "project_id": project_id,
-            "title": title, "kind": kind, "assignee_id": assignee, "status": "open"}
+    for repo_id in repo_ids:
+        check_id(repo_id, current["repos"], "repo")
+    data = {"task_id": task_id, "title": title, "kind": kind, "assignee_id": assignee,
+            "repo_ids": list(repo_ids), "status": "open"}
     append_event(root, "task.created", data)
-    emit("tracker task create", {"task": data})
+    task_dir = root / "tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    readme_path = task_dir / "README.md"
+    if not readme_path.exists():
+        readme_path.write_text(f"# {title}\n\n")
+    (task_dir / "images").mkdir(exist_ok=True)
+    emit("tracker task create", {"task": data, "artifacts": [str(readme_path), str(task_dir / "images")]})
+
+
+@task_group.command("pr")
+@click.argument("task_id")
+@click.option("--repo", "repo_id", required=True)
+@click.option("--url", required=True)
+@click.option("--number")
+@click.pass_context
+def task_pr(ctx: click.Context, task_id: str, repo_id: str, url: str, number: str | None) -> None:
+    """Link a pull request to a task."""
+    root = root_or_fail("tracker task pr", ctx.obj["directory"])
+    current = state(root)
+    check_id(task_id, current["tasks"], "task")
+    check_id(repo_id, current["repos"], "repo")
+    data = {"task_id": task_id, "repo_id": repo_id, "url": url, "number": number}
+    append_event(root, "pull_request.linked", data)
+    emit("tracker task pr", {"pull_request": data})
 
 
 @task_group.command("assign")
@@ -589,7 +483,7 @@ def task_resolve_request(ctx: click.Context, request_id: str, decision: str) -> 
 
 @main.group("memo")
 def memo_group() -> None:
-    """Build a dated daily task and feature memo."""
+    """Build a dated daily task memo."""
 
 
 @main.group("updates")
@@ -674,12 +568,9 @@ def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> 
         action_name = f"assignment_{index:04d}_action"
         engineer_name = f"assignment_{index:04d}_engineer"
         merge_name = f"assignment_{index:04d}_merge_target"
-        feature = current["features"].get(task.get("feature_id"), {})
-        source_project_id = task_project_id(task, current["features"])
         active_tasks = [candidate for candidate in current["tasks"].values()
             if candidate.get("status") not in {"done", "cancelled", "merged"}
-            and not candidate.get("completion_suspected")
-            and task_project_id(candidate, current["features"]) == source_project_id]
+            and not candidate.get("completion_suspected")]
         engineer_choices = {"No engineer selected": None}
         for person in engineers:
             label = f"{person['id']} — {person.get('display_name', person['id'])}"
@@ -688,17 +579,13 @@ def assignments_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> 
                          if candidate["id"] != task["id"] and not candidate.get("completion_suspected")]
         merge_choices = {"No merge target selected": None}
         for target in merge_targets:
-            target_feature = current["features"].get(target.get("feature_id"), {})
-            target_context = (f"feature {target_feature['title']}" if target_feature else
-                              f"project {task_project_id(target, current['features'])}" if task_project_id(target, current["features"])
-                              else "standalone")
+            target_context = ", ".join(task_repo_ids(target)) or "no linked repository"
             target_label = f"{target['id']} — {target['title']} ({target_context})"
             merge_choices[target_label] = target["id"]
         actions = ["Assign to engineer", "Leave unassigned", "Probably already completed?"]
         if merge_targets:
             actions.append("Merge into another issue")
-        task_context = (f"feature {feature['title']}" if feature else
-                        f"project {source_project_id}" if source_project_id else "standalone task")
+        task_context = ", ".join(task_repo_ids(task)) or "no linked repository"
         context = (f"{task['title']} (task {task['id']}; {task_context}; "
                    f"kind {task['kind']}; status {task.get('status', 'open')}).")
         questions.append(QuestionMultipleChoice(question_name=action_name,
@@ -870,11 +757,6 @@ def assignments_apply(ctx: click.Context, round_id: str) -> None:
             if target is None or target_id == task_id or target.get("status") in {"done", "cancelled", "merged"}:
                 warnings.append(f"No valid surviving issue was selected for task {task_id}")
                 continue
-            source_project_id = task_project_id(task, current["features"])
-            target_project_id = task_project_id(target, current["features"])
-            if source_project_id != target_project_id:
-                warnings.append(f"Cannot merge task {task_id} into a task in another project")
-                continue
             append_event(root, "task.merged", {"task_id": task_id, "target_task_id": target_id,
                 "reviewer_id": prepared["reviewer_id"], "assignment_round": round_id})
             current_tasks[task_id]["status"] = "merged"
@@ -913,10 +795,10 @@ def triage_group() -> None:
 @triage_group.command("prepare")
 @click.option("--id", "round_id", required=True)
 @click.option("--reviewer", "reviewer_id", required=True)
-@click.option("--project", "project_id", help="Limit the scan to one tracker project.")
+@click.option("--repo", "repo_id", help="Limit the scan to one registered repository ID.")
 @click.option("--limit-per-repo", type=click.IntRange(min=1, max=1000), default=50, show_default=True)
 @click.pass_context
-def triage_prepare(ctx: click.Context, round_id: str, reviewer_id: str, project_id: str | None,
+def triage_prepare(ctx: click.Context, round_id: str, reviewer_id: str, repo_id: str | None,
                    limit_per_repo: int) -> None:
     """Fetch open GitHub issues and prepare a private triage survey."""
     root = root_or_fail("tracker triage prepare", ctx.obj["directory"])
@@ -927,16 +809,16 @@ def triage_prepare(ctx: click.Context, round_id: str, reviewer_id: str, project_
     check_id(reviewer_id, current["people"], "reviewer")
     if not current["people"][reviewer_id].get("active", True):
         raise TrackerError(f"Reviewer {reviewer_id} is inactive")
-    if project_id:
-        check_id(project_id, current["projects"], "project")
+    if repo_id:
+        check_id(repo_id, current["repos"], "repo")
     round_dir = root / ".tracker" / "triage" / round_id
     private_dir = root / ".tracker" / "private" / "triage" / round_id
     if round_dir.exists() or private_dir.exists():
         raise TrackerError(f"Issue-triage round already exists: {round_id}")
     repos = [repo for repo in current["repos"].values()
-             if not project_id or repo.get("project_id") == project_id]
+             if not repo_id or repo["id"] == repo_id]
     if not repos:
-        raise TrackerError("No registered repositories found for the selected project scope")
+        raise TrackerError("No registered repositories found for the selected repository scope")
     try:
         engineers = [person for person in current["people"].values()
                      if person.get("active", True) and person.get("role", "engineer").lower() == "engineer"
@@ -967,7 +849,7 @@ def triage_prepare(ctx: click.Context, round_id: str, reviewer_id: str, project_
                 assignees = issue.get("assignees") or []
                 labels = issue.get("labels") or []
                 issues.append({"repo_id": repo["id"], "gh_repo": gh_repo,
-                    "project_id": repo.get("project_id"), "number": issue["number"],
+                    "number": issue["number"],
                     "title": str(issue.get("title", "")), "url": issue.get("url", ""),
                     "body": str(issue.get("body") or ""),
                     "author": author.get("login", "unknown") if isinstance(author, dict) else str(author),
@@ -1017,7 +899,6 @@ def triage_prepare(ctx: click.Context, round_id: str, reviewer_id: str, project_
     directory.mkdir(parents=True)
     prepared = {"schema_version": "ep-tracker.issue-triage-round/1.0", "round_id": round_id,
         "reviewer_id": reviewer_id, "created_at": datetime.now(UTC).isoformat(),
-        "project_ids": sorted({issue["project_id"] for issue in issues if issue.get("project_id")}),
         "repo_count": len(scanned_repos), "issue_count": len(issues)}
     (directory / "prepared.json").write_text(json.dumps(prepared, indent=2) + "\n")
     append_event(root, "issue_triage.prepared", {"round_id": round_id, "reviewer_id": reviewer_id,
@@ -1165,27 +1046,27 @@ def intake_group() -> None:
 @click.option("--id", "round_id", required=True)
 @click.pass_context
 def intake_prepare(ctx: click.Context, round_id: str) -> None:
-    """Build a public EDSL issue-report survey for the tracker's projects."""
+    """Build a public EDSL issue-report survey for the team's repositories."""
     root = root_or_fail("tracker intake prepare", ctx.obj["directory"])
     QuestionFreeText, QuestionMultipleChoice, _, Survey = edsl_types()
     if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
         raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
     current = state(root)
-    if not current["projects"]:
-        raise TrackerError("Add at least one project before preparing issue intake")
+    if not current["repos"]:
+        raise TrackerError("Register at least one repository before preparing issue intake")
     directory = root / ".tracker" / "intake" / round_id
     if directory.exists():
         raise TrackerError(f"Issue-intake round already exists: {round_id}")
     directory.mkdir(parents=True)
-    project_choices = {f"{project['id']} — {project['name']}": project["id"]
-        for project in current["projects"].values()}
+    repo_choices = {f"{repo['id']} — {repo['url']}": repo["id"]
+        for repo in current["repos"].values()}
     questions = [
         QuestionFreeText(question_name="reporter_name",
             question_text="Your name (required). This report will be visible to the team in its tracker."),
         QuestionFreeText(question_name="reporter_email",
             question_text="Email address (optional; include it if the team may need to follow up)."),
-        QuestionMultipleChoice(question_name="project", question_text="Which project is this issue about?",
-            question_options=list(project_choices)),
+        QuestionMultipleChoice(question_name="repo", question_text="Which repository is this issue about?",
+            question_options=list(repo_choices)),
         QuestionFreeText(question_name="issue_title", question_text="Issue title (required)."),
         QuestionFreeText(question_name="issue_description", question_text="Describe the issue, expected behavior, or requested change."),
         QuestionFreeText(question_name="related_urls",
@@ -1197,10 +1078,10 @@ def intake_prepare(ctx: click.Context, round_id: str) -> None:
     Survey.git.load(saved["path"])
     prepared = {"schema_version": "ep-tracker.issue-intake/1.0", "round_id": round_id,
         "created_at": datetime.now(UTC).isoformat(), "survey_path": str(survey_path.relative_to(root)),
-        "project_choices": project_choices}
+        "repo_choices": repo_choices}
     (directory / "prepared.json").write_text(json.dumps(prepared, indent=2) + "\n")
-    append_event(root, "issue_intake.prepared", {"round_id": round_id, "project_ids": list(current["projects"])})
-    emit("tracker intake prepare", {"round_id": round_id, "project_count": len(project_choices),
+    append_event(root, "issue_intake.prepared", {"round_id": round_id, "repo_ids": list(current["repos"])})
+    emit("tracker intake prepare", {"round_id": round_id, "repo_count": len(repo_choices),
         "survey_path": str(survey_path), "artifacts": [str(directory)],
         "next_steps": ["Review the survey, then deploy it publicly with `tracker intake deploy " + round_id + "`."]})
 
@@ -1271,7 +1152,7 @@ def intake_collect(ctx: click.Context, round_id: str) -> None:
 @click.argument("round_id")
 @click.pass_context
 def intake_apply(ctx: click.Context, round_id: str) -> None:
-    """Ingest valid public reports as new features and unassigned tasks."""
+    """Ingest valid public reports as unassigned tasks."""
     root = root_or_fail("tracker intake apply", ctx.obj["directory"])
     _, _, Results, _ = edsl_types()
     directory = root / ".tracker" / "intake" / round_id
@@ -1286,8 +1167,8 @@ def intake_apply(ctx: click.Context, round_id: str) -> None:
     collected = json.loads(collected_path.read_text())
     answer_rows = response_answers(collected["result_path"], Results)
     current = state(root)
-    project_choices = prepared["project_choices"]
-    projects_by_label = {label: project_id for label, project_id in project_choices.items()}
+    repo_choices = prepared["repo_choices"]
+    repos_by_label = {label: repo_id for label, repo_id in repo_choices.items()}
     existing_keys = {event["data"].get("response_key") for event in events(root)
         if event["kind"] == "issue_report.ingested" and event["data"].get("intake_round") == round_id}
     ingested: list[dict[str, str]] = []
@@ -1300,43 +1181,36 @@ def intake_apply(ctx: click.Context, round_id: str) -> None:
         reporter_name = str(answer.get("reporter_name", "")).strip()
         title = str(answer.get("issue_title", "")).strip()
         description = str(answer.get("issue_description", "")).strip()
-        project_id = projects_by_label.get(answer.get("project"))
+        repo_id = repos_by_label.get(answer.get("repo"))
         if not reporter_name or not title or not description:
             warnings.append(f"Response {index + 1} is missing its name, issue title, or description")
             continue
-        if project_id not in current["projects"]:
-            warnings.append(f"Response {index + 1} selected a project that is no longer available")
+        if repo_id not in current["repos"]:
+            warnings.append(f"Response {index + 1} selected a repository that is no longer available")
             continue
         urls_text = str(answer.get("related_urls", ""))
         related_urls = [part.strip() for line in urls_text.splitlines() for part in line.split(",") if part.strip()]
-        feature_id = f"intake-feature-{response_key}"
         task_id = f"intake-task-{response_key}"
         reporter_email = str(answer.get("reporter_email", "")).strip() or None
-        if feature_id not in current["features"]:
-            feature_data = {"feature_id": feature_id, "project_id": project_id, "title": title,
-                "status": "planned", "assignee_id": None, "source": "public_issue_intake",
-                "intake_round": round_id, "intake_response_key": response_key}
-            append_event(root, "feature.created", feature_data)
-            feature_dir = root / "projects" / project_id / "features" / feature_id
-            feature_dir.mkdir(parents=True, exist_ok=True)
-            safe_title = " ".join(title.splitlines()).strip()
-            readme_lines = [f"# {safe_title}", "", "## Report", "", *[f"> {line}" for line in description.splitlines()]]
-            if related_urls:
-                readme_lines.extend(["", "## References", "", *[f"- {url}" for url in related_urls]])
-            (feature_dir / "README.md").write_text("\n".join(readme_lines) + "\n")
-            (feature_dir / "images").mkdir(exist_ok=True)
-            current["features"][feature_id] = feature_data
         if task_id not in current["tasks"]:
-            task_data = {"task_id": task_id, "feature_id": feature_id, "title": title, "kind": "other",
+            task_data = {"task_id": task_id, "title": title, "kind": "other", "repo_ids": [repo_id],
                 "assignee_id": None, "status": "open", "description": description, "related_urls": related_urls,
                 "reported_by": reporter_name, "reporter_email": reporter_email,
                 "source": "public_issue_intake", "intake_round": round_id, "intake_response_key": response_key}
             append_event(root, "task.created", task_data)
             current["tasks"][task_id] = task_data
+            task_dir = root / "tasks" / task_id
+            task_dir.mkdir(parents=True, exist_ok=True)
+            safe_title = " ".join(title.splitlines()).strip()
+            readme_lines = [f"# {safe_title}", "", "## Report", "", *[f"> {line}" for line in description.splitlines()]]
+            if related_urls:
+                readme_lines.extend(["", "## References", "", *[f"- {url}" for url in related_urls]])
+            (task_dir / "README.md").write_text("\n".join(readme_lines) + "\n")
+            (task_dir / "images").mkdir(exist_ok=True)
         append_event(root, "issue_report.ingested", {"intake_round": round_id, "response_key": response_key,
-            "project_id": project_id, "feature_id": feature_id, "task_id": task_id})
+            "repo_id": repo_id, "task_id": task_id})
         existing_keys.add(response_key)
-        ingested.append({"feature_id": feature_id, "task_id": task_id, "project_id": project_id})
+        ingested.append({"task_id": task_id, "repo_id": repo_id})
     applied = {"round_id": round_id, "report_count": len(ingested), "reports": ingested,
         "warnings": warnings, "applied_at": datetime.now(UTC).isoformat()}
     applied_path.write_text(json.dumps(applied, indent=2) + "\n")
@@ -1371,10 +1245,7 @@ def updates_prepare(ctx: click.Context, round_id: str) -> None:
         mapping: dict[str, Any] = {"assigned": {}}
         for index, task in enumerate(assigned):
             status_name, note_name = f"assigned_status_{index:03d}", f"assigned_note_{index:03d}"
-            feature = current["features"].get(task.get("feature_id"), {})
-            project_id = task_project_id(task, current["features"])
-            task_context = (f"feature {feature['title']}" if feature else
-                            f"project {project_id}" if project_id else "standalone task")
+            task_context = ", ".join(task_repo_ids(task)) or "no linked repository"
             current_status = task.get("status", "open")
             status_options = [f"Keep current status ({current_status})"] + [
                 status for status in ("open", "in_progress", "blocked", "done") if status != current_status]
@@ -1547,7 +1418,7 @@ def updates_apply(ctx: click.Context, round_id: str) -> None:
     applied = {"round_id": round_id, "applied_at": datetime.now(UTC).isoformat(), **summary}
     applied_path.write_text(json.dumps(applied, indent=2) + "\n")
     append_event(root, "updates.applied", {"round_id": round_id, "status_updates": summary["status_updates"]})
-    emit("tracker updates apply", {**applied, "next_steps": ["Review the task and feature status with `tracker memo build`."]})
+    emit("tracker updates apply", {**applied, "next_steps": ["Review task status with `tracker memo build`."]})
 
 
 @main.group("priorities")
@@ -1592,10 +1463,7 @@ def priorities_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> N
         labels: list[str] = []
         label_to_task: dict[str, str] = {}
         for task in tasks:
-            feature = current["features"].get(task.get("feature_id"), {})
-            project_id = task_project_id(task, current["features"])
-            context = (f"feature: {feature['title']}" if feature else
-                       f"project: {project_id}" if project_id else "standalone")
+            context = ", ".join(task_repo_ids(task)) or "no linked repository"
             label = (f"{task['id']} — {task['title']} [{task.get('status', 'open')}; "
                      f"{task.get('kind', 'other')}; {context}]")
             labels.append(label)
@@ -1842,7 +1710,7 @@ def survey_list(ctx: click.Context, survey_type: str | None) -> None:
                     summary["reviewer_id"] = prepared.get("reviewer_id")
                     summary["task_count"] = len(prepared.get("tasks", {}))
                 elif family == "intake":
-                    summary["project_count"] = len(prepared.get("project_choices", {}))
+                    summary["repo_count"] = len(prepared.get("repo_choices", {}))
                 elif family == "priorities":
                     summary["reviewer_id"] = prepared.get("reviewer_id")
                     summary["engineer_count"] = prepared.get("engineer_count", 0)
@@ -1883,17 +1751,17 @@ def survey_guide() -> None:
          "commands": ["tracker updates prepare --id <round-id>", "tracker updates deploy <round-id>",
                       "tracker updates collect <round-id>", "tracker updates apply <round-id>"]},
         {"type": "task_assignment", "audience": "One named reviewer gets a survey containing all active unassigned tasks.",
-         "collects": "Includes feature-linked and standalone tasks. For each task, assign an engineer, leave it unassigned, flag it as probably complete for verification, or merge it into a selected surviving issue.",
+         "collects": "For each unassigned task, assign an engineer, leave it unassigned, flag it as probably complete for verification, or merge it into a selected surviving task.",
          "commands": ["tracker assignments prepare --id <round-id> --reviewer <person-id>",
                       "tracker assignments deploy <round-id>", "tracker assignments collect <round-id>",
                       "tracker assignments apply <round-id>"]},
         {"type": "issue_report", "audience": "Anyone with the public respondent URL.",
-         "collects": "Reporter name, optional email, project, issue title and description, and optional relevant URLs. Each valid report creates a feature and an unassigned task.",
+         "collects": "Reporter name, optional email, repository, issue title and description, and optional relevant URLs. Each valid report creates one unassigned task.",
          "commands": ["tracker intake prepare --id <round-id>", "tracker intake deploy <round-id>",
                       "tracker intake collect <round-id>", "tracker intake apply <round-id>"]},
         {"type": "issue_triage", "audience": "One named reviewer surveys open GitHub issues from registered repositories.",
          "collects": "Recommendations to leave open, assign to a tracked engineer, close as completed or not planned, or mark as a duplicate of a supplied GitHub issue URL. A coding agent verifies the live issue before acting.",
-         "commands": ["tracker triage prepare --id <round-id> --reviewer <person-id> [--project <project-id>]",
+         "commands": ["tracker triage prepare --id <round-id> --reviewer <person-id> [--repo <repo-id>]",
                       "tracker triage deploy <round-id>", "tracker triage collect <round-id>",
                       "tracker triage plan <round-id>"]},
         {"type": "task_priority_ranking", "audience": "One named CTO or reviewer ranks active tasks grouped by engineer.",
@@ -1923,16 +1791,7 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
     memo_date = parsed_date.isoformat()
     current = state(root)
     people = current["people"]
-    lines = [f"# Team tracker memo — {memo_date}", "", "## Features", ""]
-    features_by_status: dict[str, list[dict[str, Any]]] = {}
-    for feature in current["features"].values():
-        features_by_status.setdefault(feature.get("status", "planned"), []).append(feature)
-    for status, features in sorted(features_by_status.items()):
-        lines.extend([f"### {status}", ""])
-        for feature in features:
-            person = people.get(feature.get("assignee_id"), {})
-            lines.append(f"- **{feature['title']}** (`{feature['id']}`) — {person.get('display_name', 'unassigned')}")
-        lines.append("")
+    lines = [f"# Team tracker memo — {memo_date}", ""]
     lines.extend(["## Priority order by engineer", ""])
     active_by_person: dict[str, list[dict[str, Any]]] = {}
     for task in current["tasks"].values():
@@ -1963,11 +1822,9 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
             heading = people.get(person_id, {}).get("display_name", "Unassigned") if person_id != "unassigned" else "Unassigned"
             lines.extend([f"#### {heading}", ""])
             for task in tasks:
-                feature = current["features"].get(task.get("feature_id"), {})
-                project_id = task_project_id(task, current["features"])
-                task_context = (f"feature `{feature['id']}`" if feature else
-                                f"project `{project_id}`" if project_id else "standalone")
-                lines.append(f"- {task['title']} (`{task['id']}`, {task['kind']}) — {task_context}")
+                repo_ids = task_repo_ids(task)
+                task_context = ", ".join(f"repo `{repo_id}`" for repo_id in repo_ids) or "no linked repository"
+                lines.append(f"- {task['title']} (`{task['id']}`, {task.get('kind', 'other')}) — {task_context}")
                 if task.get("completion_suspected"):
                     lines.append("  - Reviewer thinks this may already be complete; verify before closing or assigning it.")
                 if task.get("merged_into"):
@@ -1977,7 +1834,7 @@ def memo_build(ctx: click.Context, memo_date: str) -> None:
         lines.append("")
     lines.extend(["## Linked pull requests", ""])
     for pr in current["pull_requests"]:
-        lines.append(f"- Feature `{pr['feature_id']}` · repo `{pr['repo_id']}` · [PR {pr.get('number') or pr['url']}]({pr['url']})")
+        lines.append(f"- Task `{pr['task_id']}` · repo `{pr['repo_id']}` · [PR {pr.get('number') or pr['url']}]({pr['url']})")
     lines.extend(["", "## Team updates", ""])
     latest_updates: dict[str, dict[str, Any]] = {}
     for update in current["team_updates"]:
