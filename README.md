@@ -188,8 +188,10 @@ respondent URL is public and reusable; share it intentionally.
 In their task update survey, each engineer estimates the focused work hours
 remaining to complete every active assigned task. The estimate can be left
 blank if they cannot estimate yet. Separately, the CTO or a named reviewer
-rates every active task's importance from 1 (low) to 5 (critical), independent
-of effort.
+rates every active task's importance in one matrix: tasks are rows and the
+1-to-5 importance scale is shared across rows. The rating is independent of
+effort. When the installed EDSL version does not provide matrix questions,
+the CLI builds one equivalent 1-to-5 question per task.
 
 Task lists and memos sort by **importance / estimated hours**. This is a rough
 value-per-effort signal, not a cross-engineer capacity model. Tasks missing

@@ -509,6 +509,14 @@ def edsl_numerical_question_type() -> Any:
     return QuestionNumerical
 
 
+def edsl_matrix_question_type() -> Any:
+    try:
+        from edsl import QuestionMatrix
+    except ImportError:
+        return None
+    return QuestionMatrix
+
+
 def task_value_per_hour(task: dict[str, Any]) -> float | None:
     try:
         effort = float(task["effort_hours"])
@@ -1503,6 +1511,7 @@ def priorities_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> N
     """Build a private survey for the CTO to rate active task importance."""
     root = root_or_fail("tracker priorities prepare", ctx.obj["directory"])
     _, QuestionMultipleChoice, _, Survey = edsl_types()
+    QuestionMatrix = edsl_matrix_question_type()
     if not round_id or any(not (character.isalnum() or character in "_-") for character in round_id):
         raise TrackerError("Round ID may contain only letters, numbers, underscores, and hyphens")
     current = state(root)
@@ -1517,28 +1526,45 @@ def priorities_prepare(ctx: click.Context, round_id: str, reviewer_id: str) -> N
         if task.get("status") not in {"done", "cancelled", "merged"}]
     if not tasks:
         raise TrackerError("There are no active tasks to rate")
-    questions: list[Any] = []
-    task_questions: dict[str, str] = {}
-    importance_options = ["1 — Low", "2 — Modest", "3 — Meaningful", "4 — High", "5 — Critical"]
-    for index, task in enumerate(sorted(tasks, key=lambda item: item["id"])):
+    task_rows: dict[str, str] = {}
+    for task in sorted(tasks, key=lambda item: item["id"]):
         assignee = current["people"].get(task.get("assignee_id"), {}).get("display_name", "unassigned")
         context = ", ".join(task_repo_ids(task)) or "no linked repository"
-        question_name = f"task_{index:04d}_importance"
-        questions.append(QuestionMultipleChoice(question_name=question_name,
-            question_text=(f"Task {task['id']}: {task['title']} [{task.get('status', 'open')}; "
-                f"{task.get('kind', 'other')}; owner: {assignee}; {context}]. "
-                "How important is this task to team outcomes right now, independent of its effort? "
-                "1 = low, 3 = meaningful, 5 = critical."), question_options=importance_options))
-        task_questions[task["id"]] = question_name
-    survey = Survey(questions)
+        row = (f"{task['id']} — {task['title']} [{task.get('status', 'open')}; "
+               f"{task.get('kind', 'other')}; owner: {assignee}; {context}]")
+        task_rows[row] = task["id"]
+    importance_labels = {1: "Low", 2: "Modest", 3: "Meaningful", 4: "High", 5: "Critical"}
+    question_name = "task_importance"
+    if QuestionMatrix is not None:
+        matrix = QuestionMatrix(question_name=question_name,
+            question_text=("Rate how important each task is to team outcomes right now, independent of effort. "
+                "Use 1 for low importance and 5 for critical importance."),
+            question_items=list(task_rows), question_options=list(importance_labels),
+            option_labels=importance_labels, include_comment=False)
+        survey = Survey([matrix])
+        response_mode = "matrix"
+        task_questions = {}
+    else:
+        task_questions = {}
+        questions = []
+        rating_options = [f"{value} — {label}" for value, label in importance_labels.items()]
+        for index, (row, task_id) in enumerate(task_rows.items()):
+            task_question = f"task_{index:04d}_importance"
+            questions.append(QuestionMultipleChoice(question_name=task_question,
+                question_text=f"How important is this task to team outcomes right now, independent of its effort?\n\n{row}",
+                question_options=rating_options))
+            task_questions[task_id] = task_question
+        survey = Survey(questions)
+        response_mode = "individual_questions"
     round_dir.mkdir(parents=True)
     survey_path = round_dir / "task_importance.survey.ep"
     saved = survey.git.save(str(survey_path), message=f"Prepare task importance ratings {round_id}")
     Survey.git.load(saved["path"])
     manifest = {"schema_version": "ep-tracker.importance-round/1.0", "round_id": round_id,
         "reviewer_id": reviewer_id, "created_at": datetime.now(UTC).isoformat(),
-        "survey_path": str(survey_path.relative_to(root)), "tasks": task_questions,
-        "task_count": len(task_questions), "importance_options": importance_options}
+        "survey_path": str(survey_path.relative_to(root)), "question_name": question_name,
+        "task_rows": task_rows, "task_questions": task_questions, "response_mode": response_mode,
+        "task_count": len(task_rows), "importance_labels": importance_labels}
     (round_dir / "prepared.json").write_text(json.dumps(manifest, indent=2) + "\n")
     append_event(root, "priorities.prepared", {"round_id": round_id, "reviewer_id": reviewer_id,
         "task_count": manifest["task_count"]})
@@ -1635,7 +1661,16 @@ def priorities_apply(ctx: click.Context, round_id: str) -> None:
     existing = {(event["data"].get("round_id"), event["data"].get("task_id"))
         for event in events(root) if event["kind"] == "task.importance_rated"}
     summary: dict[str, Any] = {"round_id": round_id, "importance_rating_count": 0, "warnings": []}
-    for task_id, question_name in prepared["tasks"].items():
+    if prepared.get("response_mode") == "matrix":
+        raw_ratings = answer.get(prepared["question_name"])
+        if not isinstance(raw_ratings, dict):
+            raise TrackerError("The matrix response did not contain task importance ratings")
+        rating_pairs = [(task_id, raw_ratings.get(task_row))
+            for task_row, task_id in prepared["task_rows"].items()]
+    else:
+        rating_pairs = [(task_id, answer.get(question_name))
+            for task_id, question_name in prepared["task_questions"].items()]
+    for task_id, raw_rating in rating_pairs:
         task = current["tasks"].get(task_id)
         if task is None:
             summary["warnings"].append(f"Task {task_id} no longer exists")
@@ -1643,7 +1678,6 @@ def priorities_apply(ctx: click.Context, round_id: str) -> None:
         if task.get("status") in {"done", "cancelled", "merged"}:
             summary["warnings"].append(f"Task {task_id} is no longer active; its rating was skipped")
             continue
-        raw_rating = answer.get(question_name)
         try:
             importance = int(str(raw_rating).split("—", 1)[0].strip())
         except (TypeError, ValueError):
@@ -1803,7 +1837,7 @@ def survey_guide() -> None:
                       "tracker triage deploy <round-id>", "tracker triage collect <round-id>",
                       "tracker triage plan <round-id>"]},
         {"type": "task_importance_rating", "audience": "One named CTO or reviewer rates all active tasks.",
-         "collects": "Importance from 1 (low) to 5 (critical). Engineers estimate remaining work hours in their task updates. Task lists and daily memos sort by importance divided by estimated hours; tasks missing either input follow scored tasks.",
+         "collects": "Presents all active tasks as rows in one 1-to-5 importance matrix. Engineers estimate remaining work hours in their task updates. Task lists and daily memos sort by importance divided by estimated hours; tasks missing either input follow scored tasks.",
          "commands": ["tracker priorities prepare --id <round-id> --reviewer <person-id>",
                       "tracker priorities deploy <round-id>", "tracker priorities collect <round-id>",
                       "tracker priorities apply <round-id>"]},
